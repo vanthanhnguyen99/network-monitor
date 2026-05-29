@@ -97,6 +97,16 @@ void testNetTrafficCsvParser() {
   CHECK(raw.fields.at("tx_bytes") == "99000");
 }
 
+void testNetIfaceParser() {
+  netmon::LogParser parser;
+  const auto result = parser.parse("NETIFACE: ts=1767000000 if=pppoe-wan rx_bytes=120000 tx_bytes=45000");
+  CHECK(result.matched);
+  CHECK(result.type == "netiface");
+  CHECK(result.fields.at("interface") == "pppoe-wan");
+  CHECK(result.fields.at("rx_bytes") == "120000");
+  CHECK(result.fields.at("tx_bytes") == "45000");
+}
+
 void testTrafficDelta() {
   netmon::StateStore store(testConfig());
   netmon::TrafficSnapshot first;
@@ -158,6 +168,43 @@ void testTrafficDuplicateSamplesHoldRate() {
   CHECK(std::fabs(devices[0].tx_rate_bps - 80.0) < 0.001);
 }
 
+void testInterfaceRatePreferredForSummary() {
+  netmon::StateStore store(testConfig());
+  const auto now = netmon::nowSystem();
+
+  netmon::TrafficSnapshot first_device;
+  first_device.mac = "00:e0:4c:68:02:89";
+  first_device.ts = now - std::chrono::seconds(2);
+  first_device.rx_bytes = 1000;
+  first_device.tx_bytes = 1000;
+  store.updateTraffic(first_device);
+
+  netmon::TrafficSnapshot second_device = first_device;
+  second_device.ts = now - std::chrono::seconds(1);
+  second_device.rx_bytes = 1100;
+  second_device.tx_bytes = 1100;
+  store.updateTraffic(second_device);
+
+  netmon::InterfaceSnapshot first_iface;
+  first_iface.interface_name = "pppoe-wan";
+  first_iface.ts = now - std::chrono::seconds(1);
+  first_iface.rx_bytes = 5000;
+  first_iface.tx_bytes = 10000;
+  store.updateInterface(first_iface);
+
+  netmon::InterfaceSnapshot second_iface = first_iface;
+  second_iface.ts = now;
+  second_iface.rx_bytes = 7000;
+  second_iface.tx_bytes = 13000;
+  store.updateInterface(second_iface);
+
+  const auto summary = store.summary();
+  CHECK(summary.rate_source == "interface");
+  CHECK(summary.rate_interface == "pppoe-wan");
+  CHECK(std::fabs(summary.rx_rate_bps - 16000.0) < 0.001);
+  CHECK(std::fabs(summary.tx_rate_bps - 24000.0) < 0.001);
+}
+
 void testRingBufferCapacity() {
   netmon::RingBuffer<int> buffer(3);
   buffer.push(1);
@@ -214,8 +261,10 @@ int main() {
   testWANAttackParser();
   testNetDevParser();
   testNetTrafficCsvParser();
+  testNetIfaceParser();
   testTrafficDelta();
   testTrafficDuplicateSamplesHoldRate();
+  testInterfaceRatePreferredForSummary();
   testRingBufferCapacity();
   testDeviceTimeout();
   testTrustedRouterFilter();

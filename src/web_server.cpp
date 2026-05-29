@@ -596,6 +596,9 @@ std::string WebServer::summaryJson() const {
       << "\"wan_attack_5m\":" << summary.wan_attack_5m << ','
       << "\"rx_rate_bps\":" << summary.rx_rate_bps << ','
       << "\"tx_rate_bps\":" << summary.tx_rate_bps << ','
+      << "\"rate_source\":" << jsonQuote(summary.rate_source) << ','
+      << "\"rate_interface\":" << jsonQuote(summary.rate_interface) << ','
+      << "\"last_interface_ts\":" << jsonQuote(formatIso8601(summary.last_interface_ts)) << ','
       << "\"last_log_ts\":" << jsonQuote(formatIso8601(summary.last_log_ts))
       << '}';
   return out.str();

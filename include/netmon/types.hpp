@@ -53,6 +53,23 @@ struct TrafficSnapshot {
   std::uint64_t tx_bytes = 0;
 };
 
+struct InterfaceSnapshot {
+  std::string interface_name;
+  std::chrono::system_clock::time_point ts{};
+  std::uint64_t rx_bytes = 0;
+  std::uint64_t tx_bytes = 0;
+};
+
+struct InterfaceState {
+  std::string interface_name;
+  std::chrono::system_clock::time_point last_seen{};
+  std::chrono::system_clock::time_point last_rate{};
+  std::uint64_t rx_bytes_total = 0;
+  std::uint64_t tx_bytes_total = 0;
+  double rx_rate_bps = 0.0;
+  double tx_rate_bps = 0.0;
+};
+
 struct Event {
   std::string id;
   std::chrono::system_clock::time_point ts{};
@@ -83,6 +100,9 @@ struct Summary {
   std::size_t wan_attack_5m = 0;
   double rx_rate_bps = 0.0;
   double tx_rate_bps = 0.0;
+  std::string rate_source = "devices";
+  std::string rate_interface;
+  std::chrono::system_clock::time_point last_interface_ts{};
   std::chrono::system_clock::time_point last_log_ts{};
 };
 

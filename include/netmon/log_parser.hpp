@@ -23,6 +23,7 @@ class LogParser {
   ParseResult parseWANAttack(std::string_view line) const;
   ParseResult parseDHCP(std::string_view line) const;
   ParseResult parseNetDev(std::string_view line) const;
+  ParseResult parseNetIface(std::string_view line) const;
   ParseResult parseNetTraffic(std::string_view line) const;
   ParseResult parseWanLink(std::string_view line) const;
   ParseResult parseHostapd(std::string_view line) const;

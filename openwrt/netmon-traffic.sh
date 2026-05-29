@@ -1,5 +1,18 @@
 #!/bin/sh
 
+NETMON_LIB="${NETMON_LIB:-/usr/lib/netmon/netmon-lib.sh}"
+[ -r "$NETMON_LIB" ] && . "$NETMON_LIB"
+
+emit_netmon() {
+  if command -v netmon_send >/dev/null 2>&1; then
+    netmon_send "$@"
+  else
+    tag="$1"
+    shift
+    logger -t "$tag" "$*"
+  fi
+}
+
 TS="$(date +%s)"
 TMP="/tmp/netmon-traffic.$$"
 trap 'rm -f "$TMP"' EXIT
@@ -32,17 +45,17 @@ while IFS= read -r line; do
   case "$mac" in
     *:*:*:*:*:*) ;;
     *)
-      logger -t NETTRAFFIC "ts=$TS csv=$line"
+      emit_netmon NETTRAFFIC "ts=$TS csv=$line"
       continue
       ;;
   esac
 
   case "$rx_bytes:$tx_bytes" in
     *[!0-9:]*|:|*:|:*)
-      logger -t NETTRAFFIC "ts=$TS csv=$line"
+      emit_netmon NETTRAFFIC "ts=$TS csv=$line"
       continue
       ;;
   esac
 
-  logger -t NETTRAFFIC "ts=$TS mac=$mac rx_bytes=$rx_bytes tx_bytes=$tx_bytes rx_pkts=$rx_pkts tx_pkts=$tx_pkts conns=$conns"
+  emit_netmon NETTRAFFIC "ts=$TS mac=$mac rx_bytes=$rx_bytes tx_bytes=$tx_bytes rx_pkts=$rx_pkts tx_pkts=$tx_pkts conns=$conns"
 done < "$TMP"

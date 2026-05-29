@@ -4,11 +4,28 @@ START=95
 STOP=10
 USE_PROCD=1
 
+[ -r /etc/netmon-collector.conf ] && . /etc/netmon-collector.conf
+
 INTERVAL_SECONDS="${NETMON_INTERVAL_SECONDS:-5}"
+IFACE_INTERVAL_SECONDS="${NETMON_IFACE_INTERVAL_SECONDS:-1}"
+DEVICES_INTERVAL_SECONDS="${NETMON_DEVICES_INTERVAL_SECONDS:-5}"
+TRAFFIC_INTERVAL_SECONDS="${NETMON_TRAFFIC_INTERVAL_SECONDS:-3}"
+WAN_IFACE="${NETMON_WAN_IFACE:-}"
+SERVER_IP="${NETMON_SERVER_IP:-}"
+SERVER_PORT="${NETMON_SERVER_PORT:-1514}"
+SEND_MODE="${NETMON_SEND_MODE:-direct}"
 
 start_service() {
   procd_open_instance
   procd_set_param command /usr/bin/netmon-collector-loop.sh "$INTERVAL_SECONDS"
+  procd_set_param env \
+    NETMON_IFACE_INTERVAL_SECONDS="$IFACE_INTERVAL_SECONDS" \
+    NETMON_DEVICES_INTERVAL_SECONDS="$DEVICES_INTERVAL_SECONDS" \
+    NETMON_TRAFFIC_INTERVAL_SECONDS="$TRAFFIC_INTERVAL_SECONDS" \
+    NETMON_SERVER_PORT="$SERVER_PORT" \
+    NETMON_SEND_MODE="$SEND_MODE"
+  [ -n "$WAN_IFACE" ] && procd_append_param env NETMON_WAN_IFACE="$WAN_IFACE"
+  [ -n "$SERVER_IP" ] && procd_append_param env NETMON_SERVER_IP="$SERVER_IP"
   procd_set_param respawn 3600 5 5
   procd_set_param stdout 1
   procd_set_param stderr 1

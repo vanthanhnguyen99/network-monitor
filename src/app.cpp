@@ -165,6 +165,19 @@ void App::applyParseResult(const ParseResult& result, const std::string& peer_ip
     return;
   }
 
+  if (result.type == "netiface") {
+    if (result.fields.contains("rx_bytes") && result.fields.contains("tx_bytes")) {
+      InterfaceSnapshot snapshot;
+      snapshot.interface_name = fieldOr(result, "interface", fieldOr(result, "if", fieldOr(result, "iface")));
+      snapshot.ts = event.ts;
+      snapshot.rx_bytes = parseUint64(fieldOr(result, "rx_bytes"), 0);
+      snapshot.tx_bytes = parseUint64(fieldOr(result, "tx_bytes"), 0);
+      state_.updateInterface(snapshot);
+      publishUpdate("summary_update");
+    }
+    return;
+  }
+
   if (result.type == "wan_attack") {
     WANAttackEvent attack;
     attack.ts = event.ts;

@@ -2,19 +2,23 @@ const params = new URLSearchParams(window.location.search);
 const token = params.get("token") || "";
 
 const state = {
+  summary: null,
   devices: [],
   events: [],
   attacks: [],
   history: [],
   socket: null,
   lastUpdatedAt: null,
+  summaryRefreshTimer: null,
   fastRefreshTimer: null,
   slowRefreshTimer: null,
+  summaryRefreshInFlight: false,
   fastRefreshInFlight: false,
   slowRefreshInFlight: false,
 };
 
-const FAST_REFRESH_MS = 5000;
+const SUMMARY_REFRESH_MS = 1000;
+const FAST_REFRESH_MS = 3000;
 const SLOW_REFRESH_MS = 30000;
 const EVENTS_LIMIT = 40;
 const WAN_ATTACKS_LIMIT = 80;
@@ -143,7 +147,7 @@ function addHistorySample(summary) {
   };
 
   const last = state.history[state.history.length - 1];
-  if (last && now - last.ts < 2500) {
+  if (last && now - last.ts < 900) {
     state.history[state.history.length - 1] = sample;
   } else {
     state.history.push(sample);
@@ -500,6 +504,7 @@ async function refreshFast() {
       fetchJson("/api/summary"),
       fetchJson("/api/devices"),
     ]);
+    state.summary = summary;
     state.devices = devices;
     addHistorySample(summary);
     renderSummary(summary, devices);
@@ -514,6 +519,24 @@ async function refreshFast() {
     setText("connectionState", `Disconnected: ${error.message}`);
   } finally {
     state.fastRefreshInFlight = false;
+  }
+}
+
+async function refreshSummaryOnly() {
+  if (state.summaryRefreshInFlight || state.fastRefreshInFlight) return;
+  state.summaryRefreshInFlight = true;
+  try {
+    const summary = await fetchJson("/api/summary");
+    state.summary = summary;
+    addHistorySample(summary);
+    renderSummary(summary, state.devices);
+    renderCharts();
+    setText("connectionState", "Live");
+    markUpdated();
+  } catch (error) {
+    setText("connectionState", `Disconnected: ${error.message}`);
+  } finally {
+    state.summaryRefreshInFlight = false;
   }
 }
 
@@ -549,6 +572,14 @@ function scheduleFastRefresh(delay = 800) {
   }, delay);
 }
 
+function scheduleSummaryRefresh(delay = 50) {
+  if (state.summaryRefreshTimer) return;
+  state.summaryRefreshTimer = window.setTimeout(() => {
+    state.summaryRefreshTimer = null;
+    refreshSummaryOnly();
+  }, delay);
+}
+
 function scheduleSlowRefresh(delay = 2500) {
   if (state.slowRefreshTimer) return;
   state.slowRefreshTimer = window.setTimeout(() => {
@@ -575,6 +606,10 @@ function connectSocket() {
     if (type === "wan_attack" || type === "event" || type === "connected") {
       scheduleSlowRefresh();
     }
+    if (type === "summary_update") {
+      scheduleSummaryRefresh();
+      return;
+    }
     scheduleFastRefresh();
   });
   socket.addEventListener("close", () => {
@@ -593,5 +628,6 @@ setupThemeControls();
 refreshAll();
 connectSocket();
 window.setInterval(refreshFast, FAST_REFRESH_MS);
+window.setInterval(refreshSummaryOnly, SUMMARY_REFRESH_MS);
 window.setInterval(refreshSlow, SLOW_REFRESH_MS);
 window.setInterval(updateAgeLabel, 1000);

@@ -190,6 +190,7 @@ ParseResult LogParser::parse(std::string_view line) const {
   for (const auto parser : {
            &LogParser::parseWANAttack,
            &LogParser::parseNetDev,
+           &LogParser::parseNetIface,
            &LogParser::parseNetTraffic,
            &LogParser::parseDHCP,
            &LogParser::parseWanLink,
@@ -301,6 +302,23 @@ ParseResult LogParser::parseNetDev(std::string_view line) const {
   }
   if (const auto it = result.fields.find("host"); it != result.fields.end()) {
     result.fields["hostname"] = it->second;
+  }
+  return result;
+}
+
+ParseResult LogParser::parseNetIface(std::string_view line) const {
+  ParseResult result;
+  if (line.find("NETIFACE") == std::string_view::npos) {
+    return result;
+  }
+
+  result.matched = true;
+  result.type = "netiface";
+  result.fields = parseKeyValueFields(afterTag(line, "NETIFACE"));
+  if (const auto it = result.fields.find("if"); it != result.fields.end()) {
+    result.fields["interface"] = it->second;
+  } else if (const auto iface_it = result.fields.find("iface"); iface_it != result.fields.end()) {
+    result.fields["interface"] = iface_it->second;
   }
   return result;
 }

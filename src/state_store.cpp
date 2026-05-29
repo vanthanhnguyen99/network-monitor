@@ -10,6 +10,8 @@
 namespace netmon {
 namespace {
 
+constexpr std::chrono::seconds kInterfaceRateFreshWindow{10};
+
 bool isReachableNeighbour(const std::string& state) {
   const std::string normalized = upper(state);
   return normalized == "REACHABLE" || normalized == "STALE" || normalized == "DELAY" || normalized == "PROBE";
@@ -155,6 +157,47 @@ void StateStore::updateTraffic(const TrafficSnapshot& snapshot) {
   touchLastLogLocked(current_snapshot.ts);
 }
 
+void StateStore::updateInterface(const InterfaceSnapshot& snapshot) {
+  if (snapshot.interface_name.empty()) {
+    return;
+  }
+
+  InterfaceSnapshot current_snapshot = snapshot;
+  if (current_snapshot.ts.time_since_epoch().count() == 0) {
+    current_snapshot.ts = nowSystem();
+  }
+
+  std::unique_lock lock(mutex_);
+  InterfaceState& state = interfaces_by_name_[current_snapshot.interface_name];
+  state.interface_name = current_snapshot.interface_name;
+
+  double rx_rate = 0.0;
+  double tx_rate = 0.0;
+  bool rate_ready = false;
+
+  if (const auto previous_it = interface_snapshots_.find(current_snapshot.interface_name); previous_it != interface_snapshots_.end()) {
+    const InterfaceSnapshot& previous = previous_it->second;
+    const auto delta_time = std::chrono::duration_cast<std::chrono::duration<double>>(current_snapshot.ts - previous.ts).count();
+    const bool counters_reset = current_snapshot.rx_bytes < previous.rx_bytes || current_snapshot.tx_bytes < previous.tx_bytes;
+    if (delta_time > 0.0 && !counters_reset) {
+      rx_rate = static_cast<double>(current_snapshot.rx_bytes - previous.rx_bytes) * 8.0 / delta_time;
+      tx_rate = static_cast<double>(current_snapshot.tx_bytes - previous.tx_bytes) * 8.0 / delta_time;
+      rate_ready = true;
+    }
+  }
+
+  interface_snapshots_[current_snapshot.interface_name] = current_snapshot;
+  state.last_seen = current_snapshot.ts;
+  state.rx_bytes_total = current_snapshot.rx_bytes;
+  state.tx_bytes_total = current_snapshot.tx_bytes;
+  state.rx_rate_bps = rx_rate;
+  state.tx_rate_bps = tx_rate;
+  if (rate_ready) {
+    state.last_rate = current_snapshot.ts;
+  }
+  touchLastLogLocked(current_snapshot.ts);
+}
+
 void StateStore::addEvent(const Event& event) {
   std::unique_lock lock(mutex_);
   pushEventLocked(event);
@@ -202,6 +245,8 @@ Summary StateStore::summary() const {
   std::shared_lock lock(mutex_);
   Summary out;
   out.last_log_ts = last_log_ts_;
+  double device_rx_rate_bps = 0.0;
+  double device_tx_rate_bps = 0.0;
   for (const auto& [_, device] : devices_by_key_) {
     const DeviceStatus status = statusFor(device, now);
     switch (status) {
@@ -218,8 +263,29 @@ Summary StateStore::summary() const {
         ++out.unknown_devices;
         break;
     }
-    out.rx_rate_bps += device.rx_rate_bps;
-    out.tx_rate_bps += device.tx_rate_bps;
+    device_rx_rate_bps += device.rx_rate_bps;
+    device_tx_rate_bps += device.tx_rate_bps;
+  }
+
+  out.rx_rate_bps = device_rx_rate_bps;
+  out.tx_rate_bps = device_tx_rate_bps;
+
+  const InterfaceState* freshest_interface = nullptr;
+  for (const auto& [_, iface] : interfaces_by_name_) {
+    if (iface.last_rate.time_since_epoch().count() == 0 || now - iface.last_rate > kInterfaceRateFreshWindow) {
+      continue;
+    }
+    if (freshest_interface == nullptr || iface.last_rate > freshest_interface->last_rate) {
+      freshest_interface = &iface;
+    }
+  }
+
+  if (freshest_interface != nullptr) {
+    out.rx_rate_bps = freshest_interface->rx_rate_bps;
+    out.tx_rate_bps = freshest_interface->tx_rate_bps;
+    out.rate_source = "interface";
+    out.rate_interface = freshest_interface->interface_name;
+    out.last_interface_ts = freshest_interface->last_seen;
   }
 
   for (const WANAttackEvent& event : wan_attacks_.raw()) {

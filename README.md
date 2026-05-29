@@ -26,6 +26,14 @@ Open the dashboard:
 http://localhost:8080
 ```
 
+Install as a host systemd service that starts the Docker Compose stack on boot:
+
+```sh
+sudo scripts/install-docker-service.sh
+```
+
+The installer checks whether `/etc/systemd/system/openwrt-netmon-lite.service` already exists before adding it. Use `--force` only when you intentionally want to overwrite the service file.
+
 Send a mock UDP log from the host:
 
 ```sh
@@ -40,6 +48,16 @@ printf '%s\n' '<13>NETTRAFFIC: ts=1767000000 mac=00:e0:4c:68:02:89 ip=192.168.10
   | nc -u -w1 127.0.0.1 1514
 
 printf '%s\n' '<13>NETTRAFFIC: ts=1767000060 mac=00:e0:4c:68:02:89 ip=192.168.10.157 rx_bytes=220000 tx_bytes=70000' \
+  | nc -u -w1 127.0.0.1 1514
+```
+
+Send mock WAN interface snapshots for near-realtime total traffic:
+
+```sh
+printf '%s\n' '<13>NETIFACE: ts=1767000000 if=pppoe-wan rx_bytes=1000000 tx_bytes=300000' \
+  | nc -u -w1 127.0.0.1 1514
+
+printf '%s\n' '<13>NETIFACE: ts=1767000001 if=pppoe-wan rx_bytes=3000000 tx_bytes=800000' \
   | nc -u -w1 127.0.0.1 1514
 ```
 
@@ -93,29 +111,32 @@ When `security.dashboard_token` is set, API and WebSocket requests require eithe
 
 Assume the Docker host is `192.168.10.10`.
 
-Configure remote syslog on the router:
+Configure remote syslog on the router. This also writes `/etc/netmon-collector.conf`, so Netmon telemetry can bypass OpenWRT log buffering and send directly to the Docker host over UDP:
 
 ```sh
 LAN_SERVER_IP=192.168.10.10 SYSLOG_PORT=1514 SYSLOG_PROTO=udp sh ./openwrt/setup-remote-syslog.sh
 ```
 
-Install the collector scripts on the router. The collector runs `NETDEV` and `NETTRAFFIC` every 5 seconds through OpenWRT `procd`:
+Install the collector scripts on the router. The collector runs lightweight `NETIFACE` WAN counters every 1 second, `NETTRAFFIC` every 3 seconds, and `NETDEV` every 5 seconds through OpenWRT `procd`:
 
 ```sh
+ssh root@192.168.10.1 'mkdir -p /usr/lib/netmon'
+scp openwrt/netmon-lib.sh root@192.168.10.1:/usr/lib/netmon/netmon-lib.sh
+scp openwrt/netmon-iface.sh root@192.168.10.1:/usr/bin/netmon-iface.sh
 scp openwrt/netmon-devices.sh root@192.168.10.1:/usr/bin/netmon-devices.sh
 scp openwrt/netmon-traffic.sh root@192.168.10.1:/usr/bin/netmon-traffic.sh
 scp openwrt/netmon-collector-loop.sh root@192.168.10.1:/usr/bin/netmon-collector-loop.sh
 scp openwrt/netmon-collector.init root@192.168.10.1:/etc/init.d/netmon-collector
-ssh root@192.168.10.1 'chmod +x /usr/bin/netmon-devices.sh /usr/bin/netmon-traffic.sh /usr/bin/netmon-collector-loop.sh /etc/init.d/netmon-collector && /etc/init.d/netmon-collector enable && /etc/init.d/netmon-collector restart'
+ssh root@192.168.10.1 'chmod +x /usr/lib/netmon/netmon-lib.sh /usr/bin/netmon-iface.sh /usr/bin/netmon-devices.sh /usr/bin/netmon-traffic.sh /usr/bin/netmon-collector-loop.sh /etc/init.d/netmon-collector && /etc/init.d/netmon-collector enable && /etc/init.d/netmon-collector restart'
 ```
 
-Traffic summaries use `nlbwmon`. The first sample sets totals; rates appear after the second changed sample for the same MAC. To avoid flicker with 5-second collection, the dashboard holds the latest non-zero rate for `state.traffic_rate_hold_seconds`.
+The top Download/Upload summary prefers `NETIFACE` WAN counters when they are fresh. On a WAN interface, `rx_bytes` is internet download into the router and `tx_bytes` is internet upload out of the router. Per-device rows still use `nlbwmon`; the first `NETTRAFFIC` sample sets totals, and rates appear after the second changed sample for the same MAC. To avoid flicker with sampled collection, the dashboard holds the latest non-zero per-device rate for `state.traffic_rate_hold_seconds`.
 
 ```sh
 ssh root@192.168.10.1 'opkg update && opkg install nlbwmon && /etc/init.d/nlbwmon enable && /etc/init.d/nlbwmon start'
 ```
 
-To change the interval later, edit `/etc/init.d/netmon-collector` and set `INTERVAL_SECONDS`, then restart the service.
+To change intervals later, edit `/etc/netmon-collector.conf` and set `NETMON_IFACE_INTERVAL_SECONDS` for WAN counters, `NETMON_DEVICES_INTERVAL_SECONDS` for device discovery, and `NETMON_TRAFFIC_INTERVAL_SECONDS` for `nlbwmon` traffic. If your WAN device is not detected correctly, set `NETMON_WAN_IFACE`, for example `pppoe-wan`, `wan`, or `eth0.2`. Set `NETMON_SEND_MODE="syslog"` only when you intentionally want telemetry to go through OpenWRT logd again.
 
 ## APIs
 
@@ -128,7 +149,7 @@ GET /api/wan-attacks?limit=100
 GET /ws
 ```
 
-The dashboard polls `/api/summary` and `/api/devices` every 5 seconds. Heavier event panels use smaller limits and refresh less often to avoid unnecessary LAN traffic.
+The dashboard polls `/api/summary` every 1 second and `/api/devices` every 3 seconds. When `NETIFACE` messages arrive over WebSocket, it also refreshes `/api/summary` immediately, without pulling the full device list each time. Heavier event panels use smaller limits and refresh less often to avoid unnecessary LAN traffic.
 
 ## Native Build For Development
 

@@ -20,6 +20,7 @@ class StateStore {
 
   void updateDevice(const DeviceState& device);
   void updateTraffic(const TrafficSnapshot& snapshot);
+  void updateInterface(const InterfaceSnapshot& snapshot);
   void addEvent(const Event& event);
   void addWANAttack(const WANAttackEvent& event);
 
@@ -44,6 +45,8 @@ class StateStore {
   std::unordered_map<std::string, DeviceState> devices_by_key_;
   std::unordered_map<std::string, std::string> ip_to_key_;
   std::unordered_map<std::string, std::deque<TrafficSnapshot>> traffic_points_;
+  std::unordered_map<std::string, InterfaceSnapshot> interface_snapshots_;
+  std::unordered_map<std::string, InterfaceState> interfaces_by_name_;
   RingBuffer<Event> events_;
   RingBuffer<WANAttackEvent> wan_attacks_;
   std::chrono::system_clock::time_point last_log_ts_{};
