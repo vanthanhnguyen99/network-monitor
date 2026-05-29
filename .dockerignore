@@ -1,0 +1,6 @@
+.git
+build
+build-*
+.cache
+*.log
+*.tmp

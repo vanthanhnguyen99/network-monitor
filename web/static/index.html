@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OpenWRT Network Dashboard</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <main class="dashboard">
+      <header class="dashboard-header">
+        <div class="title-row">
+          <h1>OpenWRT Network Dashboard</h1>
+          <span class="refresh-mark" aria-hidden="true">R</span>
+          <span id="connectionState" class="muted">Connecting</span>
+          <span id="updatedAgo" class="muted">Last updated never</span>
+        </div>
+        <div class="header-actions">
+          <div class="theme-control" role="radiogroup" aria-label="Theme">
+            <button type="button" data-theme-mode="system" aria-pressed="true">System</button>
+            <button type="button" data-theme-mode="dark" aria-pressed="false">Dark</button>
+            <button type="button" data-theme-mode="light" aria-pressed="false">Light</button>
+          </div>
+          <button id="refreshButton" class="icon-button" type="button" aria-label="Refresh dashboard">Refresh</button>
+        </div>
+      </header>
+
+      <section class="panel monitor-panel">
+        <div class="panel-title">Current Status of All Devices</div>
+        <div id="statusChips" class="status-chip-row"></div>
+      </section>
+
+      <section class="kpi-grid" aria-label="Current network metrics">
+        <article class="kpi-card">
+          <div class="kpi-title">Active Devices</div>
+          <strong id="activeDevices">0</strong>
+          <span id="deviceTotals">0 idle / 0 offline</span>
+        </article>
+        <article class="kpi-card">
+          <div class="kpi-title">Current Download</div>
+          <strong id="downloadRate">0 bps</strong>
+          <span id="topDownloadName">No top talker</span>
+        </article>
+        <article class="kpi-card">
+          <div class="kpi-title">Current Upload</div>
+          <strong id="uploadRate">0 bps</strong>
+          <span id="topUploadName">No top talker</span>
+        </article>
+        <article class="kpi-card warning-card">
+          <div class="kpi-title">WAN Drops 5m</div>
+          <strong id="wanDrops">0</strong>
+          <span id="latestAttack">No recent drops</span>
+        </article>
+        <article class="kpi-card">
+          <div class="kpi-title">Online Ratio</div>
+          <strong id="onlineRatio">0%</strong>
+          <span id="lastLog">No logs yet</span>
+        </article>
+        <article class="kpi-card">
+          <div class="kpi-title">Known Devices</div>
+          <strong id="knownDevices">0</strong>
+          <span id="trafficDevices">0 with traffic</span>
+        </article>
+      </section>
+
+      <section class="chart-grid">
+        <article class="panel chart-panel wide-chart">
+          <div class="panel-title">In Traffic of OpenWRT LAN</div>
+          <canvas id="downloadChart" height="210"></canvas>
+        </article>
+        <article class="panel chart-panel wide-chart">
+          <div class="panel-title">Out Traffic of OpenWRT LAN</div>
+          <canvas id="uploadChart" height="210"></canvas>
+        </article>
+        <article class="panel chart-panel">
+          <div class="panel-title">Packets / Activity Estimate</div>
+          <canvas id="combinedChart" height="210"></canvas>
+        </article>
+        <article class="panel chart-panel">
+          <div class="panel-title">Device State</div>
+          <canvas id="stateChart" height="210"></canvas>
+        </article>
+        <article class="panel chart-panel">
+          <div class="panel-title">WAN Drop Trend</div>
+          <canvas id="wanChart" height="210"></canvas>
+        </article>
+        <article class="panel table-panel">
+          <div class="panel-title">Top Talkers</div>
+          <div class="split-lists">
+            <ol id="topDownload" class="rank-list"></ol>
+            <ol id="topUpload" class="rank-list"></ol>
+          </div>
+        </article>
+        <article class="panel table-panel">
+          <div class="panel-title">WAN Attack Sources</div>
+          <div id="attackSources" class="source-list"></div>
+        </article>
+        <article class="panel table-panel events-panel">
+          <div class="panel-title">Event Stream</div>
+          <div id="eventStream" class="event-stream"></div>
+        </article>
+      </section>
+
+      <section class="panel devices-panel">
+        <div class="panel-title">Device Inventory</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Hostname</th>
+                <th>IP</th>
+                <th>MAC</th>
+                <th>Download</th>
+                <th>Upload</th>
+                <th>Last seen</th>
+              </tr>
+            </thead>
+            <tbody id="devicesBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

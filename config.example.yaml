@@ -1,0 +1,32 @@
+server:
+  http_addr: "0.0.0.0:8080"
+  syslog_udp_addr: "0.0.0.0:1514"
+  syslog_tcp_addr: "0.0.0.0:1514"
+  enable_udp: true
+  enable_tcp: false
+
+state:
+  device_online_ttl_seconds: 180
+  device_idle_ttl_seconds: 600
+  device_keep_ttl_seconds: 3600
+  max_events: 2000
+  max_attack_events: 1000
+  max_traffic_points_per_device: 60
+  traffic_rate_hold_seconds: 75
+
+storage:
+  mode: "memory"
+  enable_debug_file_log: false
+  debug_log_path: "./netmon-debug.log"
+  debug_log_max_mb: 10
+
+security:
+  bind_lan_only: true
+  dashboard_token: ""
+  max_syslog_line_length: 4096
+  trusted_router_ips:
+    # Add your router IP to enforce a source allowlist, for example:
+    # - "192.168.10.1"
+
+web:
+  root: "./web/static"

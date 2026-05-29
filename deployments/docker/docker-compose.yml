@@ -1,0 +1,25 @@
+services:
+  openwrt-netmon-lite:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    image: openwrt-netmon-lite:local
+    restart: unless-stopped
+    ports:
+      - "8080:8080/tcp"
+      - "1514:1514/udp"
+      - "1514:1514/tcp"
+    volumes:
+      - ../../config.example.yaml:/app/config.yaml:ro
+    environment:
+      NETMON_HTTP_ADDR: "0.0.0.0:8080"
+      NETMON_SYSLOG_UDP_ADDR: "0.0.0.0:1514"
+      NETMON_ENABLE_UDP: "true"
+      NETMON_ENABLE_TCP: "false"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

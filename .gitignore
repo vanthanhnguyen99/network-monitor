@@ -1,0 +1,48 @@
+# Build outputs
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Binaries and objects
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+openwrt-netmon-lite
+netmon_tests
+
+# Runtime/log artifacts
+*.log
+netmon-debug.log
+*.pid
+*.tmp
+tmp/
+
+# Docker/local overrides
+docker-compose.override.yml
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Cache directories
+.cache/
+.pytest_cache/
