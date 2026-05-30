@@ -1,7 +1,12 @@
 #include "netmon/app.hpp"
 
+#include <algorithm>
 #include <iostream>
+#include <stdexcept>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "netmon/utils.hpp"
 
@@ -33,6 +38,76 @@ Event makeEvent(StateStore& state, const ParseResult& result, const std::string&
   return event;
 }
 
+std::string cleanStorageValue(std::string_view value, std::size_t max_length = 240) {
+  std::string out;
+  out.reserve(std::min(value.size(), max_length));
+  for (const unsigned char ch : value) {
+    if (ch == '\n' || ch == '\r' || ch == '\t') {
+      out.push_back(' ');
+    } else if (ch >= 0x20 && ch != 0x7f) {
+      out.push_back(static_cast<char>(ch));
+    }
+    if (out.size() >= max_length) {
+      break;
+    }
+  }
+  out = trim(out);
+  if (value.size() > max_length && out.size() >= 3) {
+    out.resize(max_length - 3);
+    out += "...";
+  }
+  return out;
+}
+
+bool storageFieldAllowed(const std::string& type, const std::string& key) {
+  static const std::vector<std::string> common = {
+      "ts", "event", "mac", "ip", "hostname", "host", "interface", "if", "iface", "neigh",
+      "rx_bytes", "tx_bytes", "in_if", "src_ip", "dst_ip", "src_port", "dst_port", "proto", "len", "state", "message"};
+  if (std::find(common.begin(), common.end(), key) != common.end()) {
+    return true;
+  }
+  return type == "wan_attack" && (key == "tos" || key == "ttl" || key == "out_if");
+}
+
+Event preprocessEventForStorage(Event event) {
+  event.source = cleanStorageValue(event.source, 80);
+  event.message = event.type == "raw" ? "Unparsed syslog line" : cleanStorageValue(event.message, 240);
+
+  std::unordered_map<std::string, std::string> cleaned;
+  for (const auto& [key, value] : event.fields) {
+    const std::string normalized_key = lower(cleanStorageValue(key, 48));
+    if (normalized_key.empty()) {
+      continue;
+    }
+    if (normalized_key == "raw" || normalized_key == "csv") {
+      cleaned[normalized_key + "_preview"] = cleanStorageValue(value, 180);
+      cleaned[normalized_key + "_len"] = std::to_string(value.size());
+      continue;
+    }
+    if (!storageFieldAllowed(event.type, normalized_key)) {
+      continue;
+    }
+    cleaned[normalized_key] = normalized_key == "mac" ? lower(cleanStorageValue(value, 96)) : cleanStorageValue(value, 180);
+    if (cleaned.size() >= 40) {
+      break;
+    }
+  }
+  event.fields = std::move(cleaned);
+  return event;
+}
+
+WANAttackEvent preprocessWANAttackForStorage(WANAttackEvent event) {
+  event.in_if = cleanStorageValue(event.in_if, 64);
+  event.src_ip = cleanStorageValue(event.src_ip, 64);
+  event.dst_ip = cleanStorageValue(event.dst_ip, 64);
+  event.src_port = cleanStorageValue(event.src_port, 16);
+  event.dst_port = cleanStorageValue(event.dst_port, 16);
+  event.proto = cleanStorageValue(event.proto, 24);
+  event.length = cleanStorageValue(event.length, 24);
+  event.raw = cleanStorageValue(event.raw, 240);
+  return event;
+}
+
 }  // namespace
 
 App::App(Config config)
@@ -43,8 +118,18 @@ App::~App() {
 }
 
 void App::start() {
+  const std::string storage_mode = lower(config_.storage_mode);
+  if (storage_mode != "memory" && storage_mode != "sqlite") {
+    throw std::runtime_error("storage.mode must be memory or sqlite");
+  }
+  sqlite_store_ = std::make_unique<SqliteStore>(config_);
+  if (sqlite_store_->enabled()) {
+    sqlite_store_->loadInto(state_);
+    std::cerr << "sqlite: enabled at " << config_.sqlite_path << '\n';
+  }
+
   running_ = true;
-  web_server_ = std::make_unique<WebServer>(config_, state_, started_at_);
+  web_server_ = std::make_unique<WebServer>(config_, state_, stats_, sqlite_store_.get(), started_at_);
   syslog_server_ = std::make_unique<SyslogServer>(config_, [this](std::string line, std::string peer_ip) {
     handleLog(std::move(line), std::move(peer_ip));
   });
@@ -78,6 +163,8 @@ void App::wait() {
 void App::handleLog(std::string line, std::string peer_ip) {
   ParseResult result = parser_.parse(line);
   if (!result.matched) {
+    stats_.recordSyslogMessage("raw");
+    stats_.recordParseError();
     result.type = "raw";
     result.raw = line;
     Event event = makeEvent(state_, result, peer_ip);
@@ -85,10 +172,12 @@ void App::handleLog(std::string line, std::string peer_ip) {
     event.message = line;
     event.fields["raw"] = line;
     state_.addEvent(event);
+    persistEvent(event);
     publishUpdate("event");
     return;
   }
 
+  stats_.recordSyslogMessage(result.type);
   applyParseResult(result, peer_ip);
 }
 
@@ -101,6 +190,11 @@ void App::runCleanupLoop() {
       break;
     }
     state_.cleanup(nowSystem());
+    persistDevices();
+    persistRecentEvents();
+    if (sqlite_store_ && sqlite_store_->enabled()) {
+      sqlite_store_->applyRetention();
+    }
     publishUpdate("summary_update");
   }
 }
@@ -123,6 +217,8 @@ void App::applyParseResult(const ParseResult& result, const std::string& peer_ip
     event.type = "device";
     event.message = "Device snapshot";
     state_.addEvent(event);
+    persistDevices();
+    persistEvent(event);
     publishUpdate("device_update");
     return;
   }
@@ -141,6 +237,8 @@ void App::applyParseResult(const ParseResult& result, const std::string& peer_ip
     event.type = "dhcp";
     event.message = fieldOr(result, "event", "DHCP event");
     state_.addEvent(event);
+    persistDevices();
+    persistEvent(event);
     publishUpdate("device_update");
     return;
   }
@@ -154,6 +252,8 @@ void App::applyParseResult(const ParseResult& result, const std::string& peer_ip
       snapshot.rx_bytes = parseUint64(fieldOr(result, "rx_bytes"), 0);
       snapshot.tx_bytes = parseUint64(fieldOr(result, "tx_bytes"), 0);
       state_.updateTraffic(snapshot);
+      persistTraffic(snapshot);
+      persistDevices();
       event.type = "traffic";
       event.message = "Traffic snapshot";
     } else {
@@ -161,6 +261,7 @@ void App::applyParseResult(const ParseResult& result, const std::string& peer_ip
       event.message = "Traffic CSV snapshot";
     }
     state_.addEvent(event);
+    persistEvent(event);
     publishUpdate("traffic_update");
     return;
   }
@@ -190,9 +291,12 @@ void App::applyParseResult(const ParseResult& result, const std::string& peer_ip
     attack.length = fieldOr(result, "len");
     attack.raw = result.raw;
     state_.addWANAttack(attack);
+    stats_.recordWANAttack();
     event.severity = EventSeverity::Critical;
     event.message = "WAN attack/firewall drop";
     state_.addEvent(event);
+    persistWANAttack(attack);
+    persistEvent(event);
     publishUpdate("wan_attack");
     return;
   }
@@ -204,6 +308,7 @@ void App::applyParseResult(const ParseResult& result, const std::string& peer_ip
       event.severity = EventSeverity::Warning;
     }
     state_.addEvent(event);
+    persistEvent(event);
     publishUpdate("event");
     return;
   }
@@ -222,11 +327,14 @@ void App::applyParseResult(const ParseResult& result, const std::string& peer_ip
     event.type = "device";
     event.message = fieldOr(result, "event", "WiFi client event");
     state_.addEvent(event);
+    persistDevices();
+    persistEvent(event);
     publishUpdate("device_update");
     return;
   }
 
   state_.addEvent(event);
+  persistEvent(event);
   publishUpdate("event");
 }
 
@@ -235,6 +343,39 @@ void App::publishUpdate(const std::string& type) {
     return;
   }
   web_server_->broadcast("{\"type\":" + jsonQuote(type) + ",\"payload\":{}}");
+}
+
+void App::persistDevices() {
+  if (sqlite_store_ && sqlite_store_->enabled()) {
+    sqlite_store_->upsertDevices(state_.devices());
+  }
+}
+
+void App::persistEvent(const Event& event) {
+  if (sqlite_store_ && sqlite_store_->enabled()) {
+    sqlite_store_->insertEvent(preprocessEventForStorage(event));
+  }
+}
+
+void App::persistTraffic(const TrafficSnapshot& snapshot) {
+  if (sqlite_store_ && sqlite_store_->enabled()) {
+    sqlite_store_->insertTraffic(snapshot);
+  }
+}
+
+void App::persistWANAttack(const WANAttackEvent& event) {
+  if (sqlite_store_ && sqlite_store_->enabled()) {
+    sqlite_store_->insertWANAttack(preprocessWANAttackForStorage(event));
+  }
+}
+
+void App::persistRecentEvents() {
+  if (!sqlite_store_ || !sqlite_store_->enabled()) {
+    return;
+  }
+  for (const Event& event : state_.recentEvents(config_.max_events)) {
+    sqlite_store_->insertEvent(preprocessEventForStorage(event));
+  }
 }
 
 }  // namespace netmon

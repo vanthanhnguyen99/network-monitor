@@ -2,6 +2,7 @@
 #include <chrono>
 #include <csignal>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -42,19 +43,20 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, handleSignal);
 
   netmon::Config config = netmon::loadConfig(config_path);
-  if (config.storage_mode != "memory") {
-    std::cerr << "storage.mode must be memory for this MVP\n";
-    return 2;
-  }
   if (config.enable_debug_file_log) {
     std::cerr << "debug file logging is disabled in this MVP build; using stdout/stderr only\n";
   }
 
-  netmon::App app(config);
-  app.start();
-  while (!stop_requested.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  try {
+    netmon::App app(config);
+    app.start();
+    while (!stop_requested.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    app.stop();
+  } catch (const std::exception& ex) {
+    std::cerr << "fatal: " << ex.what() << '\n';
+    return 2;
   }
-  app.stop();
   return 0;
 }

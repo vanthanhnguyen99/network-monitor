@@ -13,6 +13,9 @@ add_library(netmon_core
   src/config.cpp
   src/log_parser.cpp
   src/net_utils.cpp
+  src/prometheus_exporter.cpp
+  src/runtime_stats.cpp
+  src/sqlite_store.cpp
   src/state_store.cpp
   src/syslog_server.cpp
   src/utils.cpp
@@ -22,7 +25,7 @@ add_library(netmon_core
 target_include_directories(netmon_core PUBLIC include)
 target_compile_definitions(netmon_core PUBLIC NETMON_VERSION="${PROJECT_VERSION}")
 target_compile_options(netmon_core PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(netmon_core PUBLIC pthread)
+target_link_libraries(netmon_core PUBLIC pthread ${CMAKE_DL_LIBS})
 
 if(NETMON_ENABLE_SANITIZERS)
   target_compile_options(netmon_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)

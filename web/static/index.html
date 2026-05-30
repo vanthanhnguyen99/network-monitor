@@ -3,106 +3,96 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>OpenWRT Network Dashboard</title>
+    <title>OpenWRT Netmon Lite</title>
     <link rel="stylesheet" href="/style.css">
   </head>
   <body>
-    <main class="dashboard">
-      <header class="dashboard-header">
-        <div class="title-row">
-          <h1>OpenWRT Network Dashboard</h1>
-          <span class="refresh-mark" aria-hidden="true">R</span>
-          <span id="connectionState" class="muted">Connecting</span>
-          <span id="updatedAgo" class="muted">Last updated never</span>
+    <header class="grafana-topbar">
+      <div class="brand-mark" aria-label="OpenWRT Netmon Lite">G</div>
+      <div class="search-box">Search or jump to...</div>
+      <div class="top-actions">
+        <span>cmd+k</span>
+        <span>+</span>
+        <span>?</span>
+        <span class="avatar">N</span>
+      </div>
+    </header>
+
+    <nav class="breadcrumb-bar">
+      <button class="ghost-button" type="button">☰</button>
+      <span>Home</span>
+      <span class="chevron">›</span>
+      <span>Dashboards</span>
+      <span class="chevron">›</span>
+      <strong>OpenWRT Netmon</strong>
+      <div class="datasource-switch" role="radiogroup" aria-label="Data source">
+        <button type="button" data-source="live" aria-pressed="true">Live memory</button>
+        <button id="sqliteSourceButton" type="button" data-source="sqlite" aria-pressed="false">SQLite</button>
+      </div>
+      <div class="time-range">Last 3 hours</div>
+    </nav>
+
+    <main class="dashboard-grid">
+      <section class="panel throughput-panel">
+        <div class="panel-title"><span>Throughput</span><small id="realtimeSource">memory</small></div>
+        <canvas id="throughputChart" height="250"></canvas>
+        <div class="legend-row"><span class="upload">Upload</span><span class="download">Download</span><span class="total">Total</span></div>
+      </section>
+
+      <section class="panel top-active-panel">
+        <div class="panel-title"><span>Top Active Clients</span><small>live rate</small></div>
+        <div id="topActiveClients" class="active-client-list"></div>
+      </section>
+
+      <section class="panel direction-panel">
+        <div class="panel-title"><span>Traffic Direction Split</span><small>24h SQLite</small></div>
+        <div class="direction-layout">
+          <canvas id="directionDonut" height="190"></canvas>
+          <div id="directionLegend" class="donut-legend"></div>
         </div>
-        <div class="header-actions">
-          <div class="theme-control" role="radiogroup" aria-label="Theme">
-            <button type="button" data-theme-mode="system" aria-pressed="true">System</button>
-            <button type="button" data-theme-mode="dark" aria-pressed="false">Dark</button>
-            <button type="button" data-theme-mode="light" aria-pressed="false">Light</button>
-          </div>
-          <button id="refreshButton" class="icon-button" type="button" aria-label="Refresh dashboard">Refresh</button>
+      </section>
+
+      <section class="panel clients-panel">
+        <div class="panel-title"><span>Clients</span><small id="lastUpdated">never</small></div>
+        <canvas id="clientsChart" height="175"></canvas>
+        <div class="legend-row compact"><span class="clients">Clients</span></div>
+      </section>
+
+      <section class="panel unique-panel">
+        <div class="panel-title"><span>Unique Clients</span></div>
+        <strong id="uniqueClients">0</strong>
+      </section>
+
+      <section class="panel total-traffic-panel">
+        <div class="panel-title"><span>Total Traffic</span><small>24h SQLite</small></div>
+        <div class="traffic-gauges">
+          <div id="uploadGauge" class="traffic-gauge" style="--value: 0"><strong id="uploadTotal24h">0 B</strong><span>Upload</span></div>
+          <div id="downloadGauge" class="traffic-gauge" style="--value: 0"><strong id="downloadTotal24h">0 B</strong><span>Download</span></div>
+          <div id="totalGauge" class="traffic-gauge" style="--value: 0"><strong id="totalTraffic24h">0 B</strong><span>Total</span></div>
         </div>
-      </header>
-
-      <section class="panel monitor-panel">
-        <div class="panel-title">Current Status of All Devices</div>
-        <div id="statusChips" class="status-chip-row"></div>
       </section>
 
-      <section class="kpi-grid" aria-label="Current network metrics">
-        <article class="kpi-card">
-          <div class="kpi-title">Active Devices</div>
-          <strong id="activeDevices">0</strong>
-          <span id="deviceTotals">0 idle / 0 offline</span>
-        </article>
-        <article class="kpi-card">
-          <div class="kpi-title">Current Download</div>
-          <strong id="downloadRate">0 bps</strong>
-          <span id="topDownloadName">No top talker</span>
-        </article>
-        <article class="kpi-card">
-          <div class="kpi-title">Current Upload</div>
-          <strong id="uploadRate">0 bps</strong>
-          <span id="topUploadName">No top talker</span>
-        </article>
-        <article class="kpi-card warning-card">
-          <div class="kpi-title">WAN Drops 5m</div>
-          <strong id="wanDrops">0</strong>
-          <span id="latestAttack">No recent drops</span>
-        </article>
-        <article class="kpi-card">
-          <div class="kpi-title">Online Ratio</div>
-          <strong id="onlineRatio">0%</strong>
-          <span id="lastLog">No logs yet</span>
-        </article>
-        <article class="kpi-card">
-          <div class="kpi-title">Known Devices</div>
-          <strong id="knownDevices">0</strong>
-          <span id="trafficDevices">0 with traffic</span>
-        </article>
+      <section class="panel device-traffic-panel">
+        <div class="panel-title"><span>Device Traffic 24h</span><small id="deviceTrafficSource">SQLite</small></div>
+        <div class="table-wrap">
+          <table class="traffic-table">
+            <thead>
+              <tr>
+                <th>Device</th>
+                <th>IP</th>
+                <th>Download</th>
+                <th>Upload</th>
+                <th>Total</th>
+                <th>Last seen</th>
+              </tr>
+            </thead>
+            <tbody id="deviceTrafficBody"></tbody>
+          </table>
+        </div>
       </section>
 
-      <section class="chart-grid">
-        <article class="panel chart-panel wide-chart">
-          <div class="panel-title">In Traffic of OpenWRT LAN</div>
-          <canvas id="downloadChart" height="210"></canvas>
-        </article>
-        <article class="panel chart-panel wide-chart">
-          <div class="panel-title">Out Traffic of OpenWRT LAN</div>
-          <canvas id="uploadChart" height="210"></canvas>
-        </article>
-        <article class="panel chart-panel">
-          <div class="panel-title">Packets / Activity Estimate</div>
-          <canvas id="combinedChart" height="210"></canvas>
-        </article>
-        <article class="panel chart-panel">
-          <div class="panel-title">Device State</div>
-          <canvas id="stateChart" height="210"></canvas>
-        </article>
-        <article class="panel chart-panel">
-          <div class="panel-title">WAN Drop Trend</div>
-          <canvas id="wanChart" height="210"></canvas>
-        </article>
-        <article class="panel table-panel">
-          <div class="panel-title">Top Talkers</div>
-          <div class="split-lists">
-            <ol id="topDownload" class="rank-list"></ol>
-            <ol id="topUpload" class="rank-list"></ol>
-          </div>
-        </article>
-        <article class="panel table-panel">
-          <div class="panel-title">WAN Attack Sources</div>
-          <div id="attackSources" class="source-list"></div>
-        </article>
-        <article class="panel table-panel events-panel">
-          <div class="panel-title">Event Stream</div>
-          <div id="eventStream" class="event-stream"></div>
-        </article>
-      </section>
-
-      <section class="panel devices-panel">
-        <div class="panel-title">Device Inventory</div>
+      <section class="panel inventory-panel">
+        <div class="panel-title"><span>Client devices</span><small id="inventorySource">live memory / 1s</small></div>
         <div class="table-wrap">
           <table>
             <thead>
@@ -113,7 +103,8 @@
                 <th>MAC</th>
                 <th>Download</th>
                 <th>Upload</th>
-                <th>Last seen</th>
+                <th>Total</th>
+                <th>Updated</th>
               </tr>
             </thead>
             <tbody id="devicesBody"></tbody>
@@ -121,6 +112,10 @@
         </div>
       </section>
 
+      <section class="panel events-panel">
+        <div class="panel-title"><span>Preprocessed event stream</span><small id="eventSource">source: live</small></div>
+        <div id="eventStream" class="event-stream"></div>
+      </section>
     </main>
 
     <script src="/app.js" defer></script>

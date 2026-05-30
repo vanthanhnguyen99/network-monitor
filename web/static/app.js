@@ -2,28 +2,24 @@ const params = new URLSearchParams(window.location.search);
 const token = params.get("token") || "";
 
 const state = {
+  source: localStorage.getItem("netmon-source") || "live",
+  integrations: null,
   summary: null,
   devices: [],
   events: [],
   attacks: [],
-  history: [],
-  socket: null,
+  deviceTraffic24h: [],
+  liveHistory: [],
   lastUpdatedAt: null,
-  summaryRefreshTimer: null,
-  fastRefreshTimer: null,
-  slowRefreshTimer: null,
-  summaryRefreshInFlight: false,
-  fastRefreshInFlight: false,
-  slowRefreshInFlight: false,
+  socket: null,
+  fastInFlight: false,
+  slowInFlight: false,
 };
 
-const SUMMARY_REFRESH_MS = 1000;
-const FAST_REFRESH_MS = 3000;
-const SLOW_REFRESH_MS = 30000;
-const EVENTS_LIMIT = 40;
-const WAN_ATTACKS_LIMIT = 80;
 const HISTORY_LIMIT = 180;
-const THEME_STORAGE_KEY = "netmon-theme-mode";
+const FAST_REFRESH_MS = 1000;
+const SLOW_REFRESH_MS = 8000;
+const PALETTE = ["#73bf69", "#5794f2", "#f2cc0c", "#ff9830", "#b877d9", "#56a64b", "#f2495c", "#8ab8ff"];
 
 function apiUrl(path) {
   if (!token) return path;
@@ -37,63 +33,65 @@ async function fetchJson(path) {
   return response.json();
 }
 
+function itemsOf(payload) {
+  return Array.isArray(payload) ? payload : payload?.items || [];
+}
+
+function sourceQuery() {
+  return `source=${encodeURIComponent(state.source)}`;
+}
+
 function setText(id, value) {
   const node = document.getElementById(id);
   if (node) node.textContent = value;
+}
+
+function clearNode(node) {
+  while (node && node.firstChild) node.removeChild(node.firstChild);
 }
 
 function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
-function currentThemeMode() {
-  const saved = localStorage.getItem(THEME_STORAGE_KEY);
-  return ["system", "dark", "light"].includes(saved) ? saved : "system";
+function emptyCell(text, colSpan) {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = colSpan;
+  cell.className = "empty";
+  cell.textContent = text;
+  row.appendChild(cell);
+  return row;
 }
 
-function applyTheme(mode) {
-  const selected = ["system", "dark", "light"].includes(mode) ? mode : "system";
-  if (selected === "system") {
-    document.documentElement.removeAttribute("data-theme");
-  } else {
-    document.documentElement.dataset.theme = selected;
-  }
-
-  for (const button of document.querySelectorAll("[data-theme-mode]")) {
-    button.setAttribute("aria-pressed", button.dataset.themeMode === selected ? "true" : "false");
-  }
-  renderCharts();
-}
-
-function setupThemeControls() {
-  applyTheme(currentThemeMode());
-  for (const button of document.querySelectorAll("[data-theme-mode]")) {
-    button.addEventListener("click", () => {
-      const mode = button.dataset.themeMode || "system";
-      localStorage.setItem(THEME_STORAGE_KEY, mode);
-      applyTheme(mode);
-    });
-  }
-
-  const media = window.matchMedia("(prefers-color-scheme: dark)");
-  media.addEventListener("change", () => {
-    if (currentThemeMode() === "system") applyTheme("system");
-  });
+function emptyNode(text) {
+  const node = document.createElement("div");
+  node.className = "empty";
+  node.textContent = text;
+  return node;
 }
 
 function formatRate(value) {
   const rate = Number(value || 0);
-  if (rate >= 1_000_000_000) return `${(rate / 1_000_000_000).toFixed(2)} Gbps`;
-  if (rate >= 1_000_000) return `${(rate / 1_000_000).toFixed(2)} Mbps`;
-  if (rate >= 1_000) return `${(rate / 1_000).toFixed(1)} Kbps`;
-  return `${Math.round(rate)} bps`;
+  if (rate >= 1_000_000_000) return `${(rate / 1_000_000_000).toFixed(2)} Gb/s`;
+  if (rate >= 1_000_000) return `${(rate / 1_000_000).toFixed(2)} Mb/s`;
+  if (rate >= 1_000) return `${(rate / 1_000).toFixed(1)} Kb/s`;
+  return `${Math.round(rate)} b/s`;
 }
 
-function formatAxisRate(value) {
+function axisRate(value) {
   const rate = Number(value || 0);
-  if (rate >= 1_000_000) return `${(rate / 1_000_000).toFixed(1)}M`;
-  if (rate >= 1_000) return `${Math.round(rate / 1_000)}K`;
-  return `${Math.round(rate)}`;
+  if (rate >= 1_000_000) return `${(rate / 1_000_000).toFixed(0)} Mb/s`;
+  if (rate >= 1_000) return `${Math.round(rate / 1_000)} Kb/s`;
+  return `${Math.round(rate)} b/s`;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes >= 1_000_000_000) return `${(bytes / 1_000_000_000).toFixed(2)} GB`;
+  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(2)} MB`;
+  if (bytes >= 1_000) return `${(bytes / 1_000).toFixed(1)} KB`;
+  return `${Math.round(bytes)} B`;
 }
 
 function formatTime(value) {
@@ -103,9 +101,21 @@ function formatTime(value) {
   return date.toLocaleString();
 }
 
-function formatShortTime(timestamp) {
-  const date = new Date(timestamp);
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function formatAge(value) {
+  if (!value) return "never";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
+}
+
+function shortTime(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function displayName(device) {
@@ -113,231 +123,27 @@ function displayName(device) {
   return hostname || device.ip || device.mac || "Unknown";
 }
 
-function clearNode(node) {
-  while (node && node.firstChild) node.removeChild(node.firstChild);
+function knownDevices(summary = state.summary || {}) {
+  return Number(summary.active_devices || 0) + Number(summary.idle_devices || 0) + Number(summary.offline_devices || 0) + Number(summary.unknown_devices || 0);
 }
 
-function emptyNode(message) {
-  const node = document.createElement("div");
-  node.className = "empty";
-  node.textContent = message;
-  return node;
-}
-
-function emptyRow(message, colSpan) {
-  const row = document.createElement("tr");
-  const cell = document.createElement("td");
-  cell.colSpan = colSpan;
-  cell.className = "empty";
-  cell.textContent = message;
-  row.appendChild(cell);
-  return row;
-}
-
-function addHistorySample(summary) {
-  const now = Date.now();
+function addLiveSample(summary) {
   const sample = {
-    ts: now,
+    ts: Date.now(),
     rx: Number(summary.rx_rate_bps || 0),
     tx: Number(summary.tx_rate_bps || 0),
-    active: Number(summary.active_devices || 0),
-    idle: Number(summary.idle_devices || 0),
-    offline: Number(summary.offline_devices || 0),
-    wan: Number(summary.wan_attack_5m || 0),
+    clients: knownDevices(summary),
   };
-
-  const last = state.history[state.history.length - 1];
-  if (last && now - last.ts < 900) {
-    state.history[state.history.length - 1] = sample;
-  } else {
-    state.history.push(sample);
-  }
-  while (state.history.length > HISTORY_LIMIT) state.history.shift();
+  sample.total = sample.rx + sample.tx;
+  const last = state.liveHistory[state.liveHistory.length - 1];
+  if (last && sample.ts - last.ts < 850) state.liveHistory[state.liveHistory.length - 1] = sample;
+  else state.liveHistory.push(sample);
+  while (state.liveHistory.length > HISTORY_LIMIT) state.liveHistory.shift();
 }
 
-function onlineRatio(summary, devices) {
-  const total = devices.length || 0;
-  if (total === 0) return 0;
-  return Math.round((Number(summary.active_devices || 0) / total) * 100);
-}
-
-function topDevice(devices, field) {
-  return [...devices].sort((a, b) => Number(b[field] || 0) - Number(a[field] || 0))[0];
-}
-
-function renderSummary(summary, devices) {
-  const idle = Number(summary.idle_devices || 0);
-  const offline = Number(summary.offline_devices || 0);
-  const trafficDevices = devices.filter((device) => Number(device.rx_bytes_total || 0) > 0 || Number(device.tx_bytes_total || 0) > 0).length;
-  const topDown = topDevice(devices, "rx_rate_bps");
-  const topUp = topDevice(devices, "tx_rate_bps");
-
-  setText("activeDevices", summary.active_devices ?? 0);
-  setText("deviceTotals", `${idle} idle / ${offline} offline`);
-  setText("knownDevices", devices.length);
-  setText("trafficDevices", `${trafficDevices} with traffic`);
-  setText("wanDrops", summary.wan_attack_5m ?? 0);
-  setText("downloadRate", formatRate(summary.rx_rate_bps));
-  setText("uploadRate", formatRate(summary.tx_rate_bps));
-  setText("onlineRatio", `${onlineRatio(summary, devices)}%`);
-  setText("topDownloadName", topDown && Number(topDown.rx_rate_bps || 0) > 0 ? displayName(topDown) : "No active download");
-  setText("topUploadName", topUp && Number(topUp.tx_rate_bps || 0) > 0 ? displayName(topUp) : "No active upload");
-  setText("lastLog", summary.last_log_ts ? `Last log ${formatTime(summary.last_log_ts)}` : "No logs yet");
-}
-
-function renderStatusChips(devices) {
-  const chips = document.getElementById("statusChips");
-  clearNode(chips);
-  if (!devices.length) {
-    chips.appendChild(emptyNode("No devices seen"));
-    return;
-  }
-
-  const sorted = [...devices].sort((a, b) => {
-    const rank = { online: 0, idle: 1, unknown: 2, offline: 3 };
-    return (rank[a.status] ?? 2) - (rank[b.status] ?? 2) || displayName(a).localeCompare(displayName(b));
-  });
-
-  for (const device of sorted.slice(0, 32)) {
-    const chip = document.createElement("div");
-    chip.className = `device-chip ${device.status || "unknown"}`;
-    chip.title = `${displayName(device)} ${device.ip || ""} ${device.mac || ""}`;
-    chip.textContent = displayName(device);
-    chips.appendChild(chip);
-  }
-}
-
-function renderDevices(devices) {
-  const body = document.getElementById("devicesBody");
-  clearNode(body);
-  if (!devices.length) {
-    body.appendChild(emptyRow("No devices seen", 7));
-    return;
-  }
-
-  const sorted = [...devices].sort((a, b) => {
-    const aRate = Number(a.rx_rate_bps || 0) + Number(a.tx_rate_bps || 0);
-    const bRate = Number(b.rx_rate_bps || 0) + Number(b.tx_rate_bps || 0);
-    return bRate - aRate || displayName(a).localeCompare(displayName(b));
-  });
-
-  for (const device of sorted) {
-    const row = document.createElement("tr");
-    const statusCell = document.createElement("td");
-    const status = document.createElement("span");
-    status.className = `status ${device.status || "unknown"}`;
-    status.textContent = device.status || "unknown";
-    statusCell.appendChild(status);
-    row.appendChild(statusCell);
-
-    for (const value of [
-      displayName(device),
-      device.ip || "unknown",
-      device.mac || "unknown",
-      formatRate(device.rx_rate_bps),
-      formatRate(device.tx_rate_bps),
-      formatTime(device.last_seen),
-    ]) {
-      const cell = document.createElement("td");
-      cell.textContent = value;
-      row.appendChild(cell);
-    }
-    body.appendChild(row);
-  }
-}
-
-function renderRankList(id, devices, field, label) {
-  const list = document.getElementById(id);
-  clearNode(list);
-
-  const heading = document.createElement("li");
-  heading.className = "rank-heading";
-  heading.innerHTML = `<span class="rank-name">${label}</span><span class="rank-rate">Rate</span>`;
-  list.appendChild(heading);
-
-  const ranked = [...devices]
-    .filter((device) => Number(device[field] || 0) > 0)
-    .sort((a, b) => Number(b[field] || 0) - Number(a[field] || 0))
-    .slice(0, 8);
-
-  if (!ranked.length) {
-    const item = document.createElement("li");
-    item.appendChild(emptyNode("No traffic samples"));
-    list.appendChild(item);
-    return;
-  }
-
-  for (const device of ranked) {
-    const item = document.createElement("li");
-    const name = document.createElement("span");
-    name.className = "rank-name";
-    name.textContent = displayName(device);
-    const rate = document.createElement("span");
-    rate.className = "rank-rate";
-    rate.textContent = formatRate(device[field]);
-    item.append(name, rate);
-    list.appendChild(item);
-  }
-}
-
-function renderAttacks(attacks) {
-  const latest = attacks[0];
-  setText("latestAttack", latest ? `${latest.src_ip || "unknown"} -> ${latest.dst_ip || "unknown"}` : "No recent drops");
-
-  const counts = new Map();
-  for (const attack of attacks) {
-    const source = attack.src_ip || "unknown";
-    counts.set(source, (counts.get(source) || 0) + 1);
-  }
-
-  const container = document.getElementById("attackSources");
-  clearNode(container);
-  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
-  if (!ranked.length) {
-    container.appendChild(emptyNode("No WAN drops"));
-    return;
-  }
-
-  for (const [source, count] of ranked) {
-    const row = document.createElement("div");
-    row.className = "source-row";
-    const name = document.createElement("span");
-    name.textContent = source;
-    const number = document.createElement("span");
-    number.className = "source-count";
-    number.textContent = String(count);
-    row.append(name, number);
-    container.appendChild(row);
-  }
-}
-
-function renderEvents(events) {
-  const stream = document.getElementById("eventStream");
-  clearNode(stream);
-  if (!events.length) {
-    stream.appendChild(emptyNode("No events"));
-    return;
-  }
-
-  for (const event of events.slice(0, 14)) {
-    const row = document.createElement("div");
-    row.className = "event-row";
-    const main = document.createElement("div");
-    main.className = "event-main";
-    const title = document.createElement("strong");
-    title.textContent = `${event.type || "event"} / ${event.severity || "info"}`;
-    const message = document.createElement("span");
-    message.textContent = event.message || "";
-    main.append(title, message);
-    const time = document.createElement("span");
-    time.className = "event-time";
-    time.textContent = formatTime(event.ts);
-    row.append(main, time);
-    stream.appendChild(row);
-  }
-}
-
-function canvasContext(canvas) {
+function canvasContext(id) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return null;
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
   const width = Math.max(1, Math.floor(rect.width));
@@ -349,243 +155,358 @@ function canvasContext(canvas) {
   return { ctx, width, height };
 }
 
-function drawGrid(ctx, plot, yMax, labeler) {
-  ctx.strokeStyle = cssVar("--chart-grid") || "rgba(137, 150, 157, 0.36)";
-  ctx.lineWidth = 1;
-  ctx.fillStyle = cssVar("--chart-label") || "#a5b0b6";
-  ctx.font = "12px system-ui, sans-serif";
+function drawAxes(ctx, plot, max, labeler) {
+  ctx.strokeStyle = cssVar("--grid");
+  ctx.fillStyle = cssVar("--muted");
+  ctx.font = "10px system-ui, sans-serif";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-
-  for (let i = 0; i <= 4; i += 1) {
-    const y = plot.bottom - (plot.height * i) / 4;
+  for (let i = 0; i <= 5; i += 1) {
+    const y = plot.bottom - (plot.height * i) / 5;
     ctx.beginPath();
     ctx.moveTo(plot.left, y);
     ctx.lineTo(plot.right, y);
     ctx.stroke();
-    const value = (yMax * i) / 4;
-    ctx.fillText(labeler(value), plot.left - 8, y);
+    ctx.fillText(labeler((max * i) / 5), plot.left - 8, y);
   }
 }
 
-function drawTimeLabels(ctx, plot, history) {
+function drawSeries(ctx, plot, history, accessor, color, max, fill) {
   if (!history.length) return;
-  ctx.fillStyle = cssVar("--chart-label") || "#a5b0b6";
-  ctx.font = "12px system-ui, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-
-  const indexes = [0, Math.floor((history.length - 1) / 2), history.length - 1];
-  for (const index of indexes) {
-    const sample = history[index];
-    if (!sample) continue;
-    const x = history.length === 1 ? plot.left : plot.left + (plot.width * index) / (history.length - 1);
-    ctx.fillText(formatShortTime(sample.ts), x, plot.bottom + 9);
-  }
-}
-
-function drawSeries(ctx, plot, history, accessor, color, fillColor) {
-  if (!history.length) return;
-  const values = history.map(accessor);
-  const maxValue = Math.max(1, ...values);
-
   ctx.beginPath();
-  values.forEach((value, index) => {
-    const x = history.length === 1 ? plot.left : plot.left + (plot.width * index) / (history.length - 1);
-    const y = plot.bottom - (Math.max(0, value) / maxValue) * plot.height;
+  history.forEach((sample, index) => {
+    const x = history.length === 1 ? plot.left : plot.left + (plot.width * index) / Math.max(1, history.length - 1);
+    const y = plot.bottom - (Math.max(0, accessor(sample)) / max) * plot.height;
     if (index === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
   ctx.strokeStyle = color;
-  ctx.lineWidth = 2;
+  ctx.lineWidth = 1.25;
   ctx.stroke();
-
-  if (fillColor) {
+  if (fill) {
     ctx.lineTo(plot.right, plot.bottom);
     ctx.lineTo(plot.left, plot.bottom);
     ctx.closePath();
-    ctx.fillStyle = fillColor;
+    ctx.fillStyle = fill;
     ctx.fill();
   }
 }
 
-function drawLineChart(canvasId, series, options = {}) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
-  const { ctx, width, height } = canvasContext(canvas);
+function drawChart(id, history, series, labeler = axisRate) {
+  const box = canvasContext(id);
+  if (!box) return;
+  const { ctx, width, height } = box;
   ctx.clearRect(0, 0, width, height);
-
-  const plot = { left: 56, right: width - 18, top: 14, bottom: height - 36 };
+  const plot = { left: 58, right: width - 12, top: 12, bottom: height - 24 };
   plot.width = Math.max(1, plot.right - plot.left);
   plot.height = Math.max(1, plot.bottom - plot.top);
-
-  const history = state.history;
-  const allValues = series.flatMap((item) => history.map(item.accessor));
-  const yMax = Math.max(1, ...allValues);
-  const labeler = options.labeler || ((value) => Math.round(value).toString());
-
-  drawGrid(ctx, plot, yMax, labeler);
-  drawTimeLabels(ctx, plot, history);
-
-  for (const item of series) {
-    drawSeries(ctx, plot, history, item.accessor, item.color, item.fill);
+  const max = Math.max(1, ...series.flatMap((item) => history.map(item.accessor)));
+  drawAxes(ctx, plot, max, labeler);
+  for (const item of series) drawSeries(ctx, plot, history, item.accessor, item.color, max, item.fill);
+  if (history.length > 2) {
+    ctx.fillStyle = cssVar("--muted");
+    ctx.font = "10px system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(shortTime(history[0].ts), plot.left, height - 6);
+    ctx.textAlign = "right";
+    ctx.fillText(shortTime(history[history.length - 1].ts), plot.right, height - 6);
   }
+}
 
-  if (options.unit) {
-    ctx.save();
-    ctx.translate(16, plot.top + plot.height / 2);
-    ctx.rotate(-Math.PI / 2);
-    ctx.fillStyle = cssVar("--chart-label") || "#a5b0b6";
-    ctx.font = "12px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText(options.unit, 0, 0);
-    ctx.restore();
+function drawDonut(id, entries) {
+  const box = canvasContext(id);
+  if (!box) return;
+  const { ctx, width, height } = box;
+  ctx.clearRect(0, 0, width, height);
+  const total = entries.reduce((sum, item) => sum + item.value, 0);
+  const cx = width / 2;
+  const cy = height / 2;
+  const radius = Math.max(32, Math.min(width, height) / 2 - 10);
+  const lineWidth = Math.max(22, radius * 0.42);
+  ctx.lineWidth = lineWidth;
+  ctx.strokeStyle = "#2a3037";
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius - lineWidth / 2, 0, Math.PI * 2);
+  ctx.stroke();
+  if (!total) return;
+  let start = -Math.PI / 2;
+  entries.forEach((entry, index) => {
+    const angle = (entry.value / total) * Math.PI * 2;
+    ctx.strokeStyle = entry.color || PALETTE[index % PALETTE.length];
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius - lineWidth / 2, start, start + angle);
+    ctx.stroke();
+    start += angle;
+  });
+}
+
+function renderLegend(id, entries, emptyText = "No data") {
+  const root = document.getElementById(id);
+  clearNode(root);
+  const total = entries.reduce((sum, item) => sum + item.value, 0) || 1;
+  if (!entries.length) {
+    root.appendChild(emptyNode(emptyText));
+    return;
   }
+  entries.slice(0, 8).forEach((entry, index) => {
+    const row = document.createElement("div");
+    row.className = "legend-item";
+    row.style.setProperty("--c", entry.color || PALETTE[index % PALETTE.length]);
+    const label = document.createElement("span");
+    label.textContent = entry.label;
+    const value = document.createElement("strong");
+    value.textContent = `${Math.round((entry.value / total) * 100)}%`;
+    row.append(label, value);
+    root.appendChild(row);
+  });
+}
 
-  if (series.length > 1) {
-    let x = plot.left;
-    for (const item of series) {
-      ctx.fillStyle = item.color;
-      ctx.fillRect(x, height - 13, 10, 10);
-      ctx.fillStyle = cssVar("--chart-label") || "#a5b0b6";
-      ctx.font = "11px system-ui, sans-serif";
-      ctx.textBaseline = "middle";
-      ctx.textAlign = "left";
-      ctx.fillText(item.label, x + 14, height - 8);
-      x += 122;
+function renderSourceButtons() {
+  const sqliteAvailable = !!state.integrations?.data_sources?.sqlite_query_enabled;
+  if (state.source === "sqlite" && !sqliteAvailable) state.source = "live";
+  for (const button of document.querySelectorAll("[data-source]")) {
+    const selected = button.dataset.source === state.source;
+    button.setAttribute("aria-pressed", selected ? "true" : "false");
+    if (button.dataset.source === "sqlite") button.disabled = !sqliteAvailable;
+  }
+}
+
+function renderSummary() {
+  const summary = state.summary || {};
+  setText("uniqueClients", knownDevices(summary));
+  setText("realtimeSource", `memory / ${summary.rate_interface || summary.rate_source || "devices"}`);
+  setText("lastUpdated", state.lastUpdatedAt ? shortTime(state.lastUpdatedAt) : "never");
+  setText("inventorySource", "live memory / 1s");
+  setText("eventSource", `source: ${state.source}`);
+  setText("deviceTrafficSource", state.integrations?.data_sources?.sqlite_query_enabled ? "SQLite" : "unavailable");
+}
+
+function setGauge(id, value, max) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const pct = max > 0 ? Math.max(2, Math.min(100, (Number(value || 0) / max) * 100)) : 0;
+  node.style.setProperty("--value", String(pct));
+}
+
+function renderTrafficTotals() {
+  const upload = state.deviceTraffic24h.reduce((sum, item) => sum + Number(item.tx_bytes || 0), 0);
+  const download = state.deviceTraffic24h.reduce((sum, item) => sum + Number(item.rx_bytes || 0), 0);
+  const total = upload + download;
+  setText("uploadTotal24h", formatBytes(upload));
+  setText("downloadTotal24h", formatBytes(download));
+  setText("totalTraffic24h", formatBytes(total));
+  setGauge("uploadGauge", upload, Math.max(total, 1));
+  setGauge("downloadGauge", download, Math.max(total, 1));
+  setGauge("totalGauge", total, Math.max(total, 1));
+}
+
+function renderTopActiveClients() {
+  const root = document.getElementById("topActiveClients");
+  clearNode(root);
+  const ranked = [...state.devices]
+    .map((device) => ({
+      ...device,
+      rx: Number(device.rx_rate_bps || 0),
+      tx: Number(device.tx_rate_bps || 0),
+      total: Number(device.rx_rate_bps || 0) + Number(device.tx_rate_bps || 0),
+    }))
+    .sort((a, b) => b.total - a.total || displayName(a).localeCompare(displayName(b)))
+    .slice(0, 6);
+  const max = Math.max(1, ...ranked.map((device) => device.total));
+  if (!ranked.length) {
+    root.appendChild(emptyNode("No active clients"));
+    return;
+  }
+  for (const device of ranked) {
+    const row = document.createElement("div");
+    row.className = "active-client-row";
+    const meta = document.createElement("div");
+    meta.className = "active-client-meta";
+    const name = document.createElement("strong");
+    name.textContent = displayName(device);
+    const detail = document.createElement("span");
+    detail.textContent = `${device.ip || device.mac || "unknown"} / ${formatRate(device.total)}`;
+    meta.append(name, detail);
+    const bar = document.createElement("div");
+    bar.className = "active-client-bar";
+    bar.style.setProperty("--rx", `${Math.max(0, (device.rx / max) * 100)}%`);
+    bar.style.setProperty("--tx", `${Math.max(0, (device.tx / max) * 100)}%`);
+    row.append(meta, bar);
+    root.appendChild(row);
+  }
+}
+
+function renderDirectionSplit() {
+  const upload = state.deviceTraffic24h.reduce((sum, item) => sum + Number(item.tx_bytes || 0), 0);
+  const download = state.deviceTraffic24h.reduce((sum, item) => sum + Number(item.rx_bytes || 0), 0);
+  const entries = [
+    { label: "Download", value: download, color: cssVar("--yellow") },
+    { label: "Upload", value: upload, color: cssVar("--green") },
+  ].filter((entry) => entry.value > 0);
+  drawDonut("directionDonut", entries);
+  renderLegend("directionLegend", entries, "No traffic");
+}
+
+function renderDeviceTraffic24h() {
+  const body = document.getElementById("deviceTrafficBody");
+  clearNode(body);
+  if (!state.deviceTraffic24h.length) {
+    body.appendChild(emptyCell("No SQLite traffic in the last 24h", 6));
+    return;
+  }
+  const max = Math.max(1, ...state.deviceTraffic24h.map((item) => Number(item.total_bytes || 0)));
+  for (const item of state.deviceTraffic24h.slice(0, 16)) {
+    const row = document.createElement("tr");
+    const values = [
+      displayName(item),
+      item.ip || "-",
+      formatBytes(item.rx_bytes),
+      formatBytes(item.tx_bytes),
+      formatBytes(item.total_bytes),
+      formatTime(item.last_ts),
+    ];
+    values.forEach((value, index) => {
+      const cell = document.createElement("td");
+      if (index === 4) {
+        const bar = document.createElement("div");
+        bar.className = "traffic-total-cell";
+        bar.style.setProperty("--w", `${Math.max(3, (Number(item.total_bytes || 0) / max) * 100)}%`);
+        const text = document.createElement("span");
+        text.textContent = value;
+        bar.appendChild(text);
+        cell.appendChild(bar);
+      } else {
+        cell.textContent = value;
+      }
+      row.appendChild(cell);
+    });
+    body.appendChild(row);
+  }
+}
+
+function renderDevices() {
+  const body = document.getElementById("devicesBody");
+  clearNode(body);
+  if (!state.devices.length) {
+    body.appendChild(emptyCell("No devices seen", 8));
+    return;
+  }
+  const sorted = [...state.devices].sort((a, b) =>
+    (Number(b.rx_rate_bps || 0) + Number(b.tx_rate_bps || 0)) - (Number(a.rx_rate_bps || 0) + Number(a.tx_rate_bps || 0)) ||
+    displayName(a).localeCompare(displayName(b))
+  );
+  for (const device of sorted.slice(0, 20)) {
+    const row = document.createElement("tr");
+    const statusCell = document.createElement("td");
+    const status = document.createElement("span");
+    status.className = `status ${device.status || "unknown"}`;
+    status.textContent = device.status || "unknown";
+    statusCell.appendChild(status);
+    row.appendChild(statusCell);
+    const rx = Number(device.rx_rate_bps || 0);
+    const tx = Number(device.tx_rate_bps || 0);
+    const updatedAt = device.last_traffic || device.last_rate || device.last_seen;
+    for (const value of [displayName(device), device.ip || "-", device.mac || "-", formatRate(rx), formatRate(tx), formatRate(rx + tx), formatAge(updatedAt)]) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.appendChild(cell);
     }
+    body.appendChild(row);
+  }
+}
+
+function renderEvents() {
+  const root = document.getElementById("eventStream");
+  clearNode(root);
+  if (!state.events.length) {
+    root.appendChild(emptyNode("No events"));
+    return;
+  }
+  for (const event of state.events.slice(0, 12)) {
+    const row = document.createElement("div");
+    row.className = "event-row";
+    const text = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = `${event.type || "event"} / ${event.severity || "info"}`;
+    const message = document.createElement("span");
+    message.textContent = event.message || "";
+    text.append(title, message);
+    const time = document.createElement("time");
+    time.textContent = shortTime(event.ts) || formatTime(event.ts);
+    row.append(text, time);
+    root.appendChild(row);
   }
 }
 
 function renderCharts() {
-  drawLineChart("downloadChart", [
-    { label: "Download", accessor: (sample) => sample.rx, color: "#44d6ee", fill: "rgba(68, 214, 238, 0.24)" },
-  ], { unit: "bps", labeler: formatAxisRate });
-
-  drawLineChart("uploadChart", [
-    { label: "Upload", accessor: (sample) => sample.tx, color: "#25d48a", fill: "rgba(37, 212, 138, 0.22)" },
-  ], { unit: "bps", labeler: formatAxisRate });
-
-  drawLineChart("combinedChart", [
-    { label: "In", accessor: (sample) => sample.rx, color: "#44d6ee" },
-    { label: "Out", accessor: (sample) => sample.tx, color: "#2ab982" },
-  ], { unit: "bps", labeler: formatAxisRate });
-
-  drawLineChart("stateChart", [
-    { label: "Online", accessor: (sample) => sample.active, color: "#30cf77", fill: "rgba(48, 207, 119, 0.16)" },
-    { label: "Idle", accessor: (sample) => sample.idle, color: "#f5c542" },
-    { label: "Offline", accessor: (sample) => sample.offline, color: "#ef5547" },
-  ], { unit: "devices" });
-
-  drawLineChart("wanChart", [
-    { label: "Drops", accessor: (sample) => sample.wan, color: "#9b5cff", fill: "rgba(155, 92, 255, 0.18)" },
-  ], { unit: "drops" });
+  drawChart("throughputChart", state.liveHistory, [
+    { accessor: (s) => s.tx, color: cssVar("--green"), fill: null },
+    { accessor: (s) => s.rx, color: cssVar("--yellow"), fill: "rgba(242, 204, 12, 0.10)" },
+    { accessor: (s) => s.total, color: cssVar("--blue"), fill: null },
+  ]);
+  drawChart("clientsChart", state.liveHistory, [
+    { accessor: (s) => s.clients, color: cssVar("--green"), fill: "rgba(115, 191, 105, 0.12)" },
+  ], (v) => Math.round(v).toString());
+  renderTopActiveClients();
+  renderDirectionSplit();
 }
 
-function markUpdated() {
-  state.lastUpdatedAt = Date.now();
-  updateAgeLabel();
-}
-
-function updateAgeLabel() {
-  if (!state.lastUpdatedAt) {
-    setText("updatedAgo", "Last updated never");
-    return;
-  }
-  const seconds = Math.max(0, Math.round((Date.now() - state.lastUpdatedAt) / 1000));
-  setText("updatedAgo", `Last updated ${seconds} seconds ago`);
+function renderAll() {
+  renderSourceButtons();
+  renderSummary();
+  renderTrafficTotals();
+  renderDeviceTraffic24h();
+  renderDevices();
+  renderEvents();
+  renderCharts();
 }
 
 async function refreshFast() {
-  if (state.fastRefreshInFlight) return;
-  state.fastRefreshInFlight = true;
+  if (state.fastInFlight) return;
+  state.fastInFlight = true;
   try {
-    const [summary, devices] = await Promise.all([
+    const [summary, integrations, devices] = await Promise.all([
       fetchJson("/api/summary"),
-      fetchJson("/api/devices"),
+      fetchJson("/api/integrations"),
+      fetchJson("/api/devices?source=live&limit=1000"),
     ]);
     state.summary = summary;
-    state.devices = devices;
-    addHistorySample(summary);
-    renderSummary(summary, devices);
-    renderStatusChips(devices);
-    renderDevices(devices);
-    renderRankList("topDownload", devices, "rx_rate_bps", "Download");
-    renderRankList("topUpload", devices, "tx_rate_bps", "Upload");
-    renderCharts();
-    setText("connectionState", "Live");
-    markUpdated();
-  } catch (error) {
-    setText("connectionState", `Disconnected: ${error.message}`);
+    state.integrations = integrations;
+    state.devices = itemsOf(devices);
+    state.lastUpdatedAt = Date.now();
+    addLiveSample(summary);
+    renderAll();
+  } catch (_) {
+    setText("lastUpdated", "disconnected");
   } finally {
-    state.fastRefreshInFlight = false;
-  }
-}
-
-async function refreshSummaryOnly() {
-  if (state.summaryRefreshInFlight || state.fastRefreshInFlight) return;
-  state.summaryRefreshInFlight = true;
-  try {
-    const summary = await fetchJson("/api/summary");
-    state.summary = summary;
-    addHistorySample(summary);
-    renderSummary(summary, state.devices);
-    renderCharts();
-    setText("connectionState", "Live");
-    markUpdated();
-  } catch (error) {
-    setText("connectionState", `Disconnected: ${error.message}`);
-  } finally {
-    state.summaryRefreshInFlight = false;
+    state.fastInFlight = false;
   }
 }
 
 async function refreshSlow() {
-  if (state.slowRefreshInFlight) return;
-  state.slowRefreshInFlight = true;
+  if (state.slowInFlight) return;
+  state.slowInFlight = true;
   try {
-    const [events, attacks] = await Promise.all([
-      fetchJson(`/api/events?limit=${EVENTS_LIMIT}`),
-      fetchJson(`/api/wan-attacks?limit=${WAN_ATTACKS_LIMIT}`),
+    const [events, attacks, deviceTraffic] = await Promise.all([
+      fetchJson(`/api/events?${sourceQuery()}&limit=80`),
+      fetchJson(`/api/wan-attacks?${sourceQuery()}&limit=100`),
+      fetchJson("/api/device-traffic-24h?limit=500"),
     ]);
-    state.events = events;
-    state.attacks = attacks;
-    renderAttacks(attacks);
-    renderEvents(events);
-    setText("connectionState", "Live");
-  } catch (error) {
-    setText("connectionState", `Disconnected: ${error.message}`);
+    state.events = itemsOf(events);
+    state.attacks = itemsOf(attacks);
+    state.deviceTraffic24h = itemsOf(deviceTraffic);
+    renderAll();
   } finally {
-    state.slowRefreshInFlight = false;
+    state.slowInFlight = false;
   }
 }
 
-async function refreshAll() {
-  await Promise.all([refreshFast(), refreshSlow()]);
-}
-
-function scheduleFastRefresh(delay = 800) {
-  if (state.fastRefreshTimer) return;
-  state.fastRefreshTimer = window.setTimeout(() => {
-    state.fastRefreshTimer = null;
-    refreshFast();
-  }, delay);
-}
-
-function scheduleSummaryRefresh(delay = 50) {
-  if (state.summaryRefreshTimer) return;
-  state.summaryRefreshTimer = window.setTimeout(() => {
-    state.summaryRefreshTimer = null;
-    refreshSummaryOnly();
-  }, delay);
-}
-
-function scheduleSlowRefresh(delay = 2500) {
-  if (state.slowRefreshTimer) return;
-  state.slowRefreshTimer = window.setTimeout(() => {
-    state.slowRefreshTimer = null;
-    refreshSlow();
-  }, delay);
+function setSource(source) {
+  state.source = source;
+  localStorage.setItem("netmon-source", source);
+  renderSourceButtons();
+  refreshFast();
+  refreshSlow();
 }
 
 function connectSocket() {
@@ -593,41 +514,18 @@ function connectSocket() {
   const path = token ? `/ws?token=${encodeURIComponent(token)}` : "/ws";
   const socket = new WebSocket(`${scheme}://${window.location.host}${path}`);
   state.socket = socket;
-
-  socket.addEventListener("open", () => setText("connectionState", "Live"));
-  socket.addEventListener("message", (event) => {
-    let type = "";
-    try {
-      type = JSON.parse(event.data).type || "";
-    } catch (_) {
-      type = "";
-    }
-
-    if (type === "wan_attack" || type === "event" || type === "connected") {
-      scheduleSlowRefresh();
-    }
-    if (type === "summary_update") {
-      scheduleSummaryRefresh();
-      return;
-    }
-    scheduleFastRefresh();
-  });
-  socket.addEventListener("close", () => {
-    setText("connectionState", "Reconnecting");
-    window.setTimeout(connectSocket, 2500);
-  });
-  socket.addEventListener("error", () => {
-    setText("connectionState", "Socket error");
-    socket.close();
-  });
+  socket.addEventListener("message", () => refreshFast());
+  socket.addEventListener("close", () => window.setTimeout(connectSocket, 2500));
+  socket.addEventListener("error", () => socket.close());
 }
 
-document.getElementById("refreshButton").addEventListener("click", refreshAll);
+for (const button of document.querySelectorAll("[data-source]")) {
+  button.addEventListener("click", () => setSource(button.dataset.source || "live"));
+}
+
 window.addEventListener("resize", renderCharts);
-setupThemeControls();
-refreshAll();
+refreshFast();
+refreshSlow();
 connectSocket();
 window.setInterval(refreshFast, FAST_REFRESH_MS);
-window.setInterval(refreshSummaryOnly, SUMMARY_REFRESH_MS);
 window.setInterval(refreshSlow, SLOW_REFRESH_MS);
-window.setInterval(updateAgeLabel, 1000);

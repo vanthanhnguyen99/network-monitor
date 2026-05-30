@@ -28,6 +28,8 @@ class StateStore {
   std::vector<Event> recentEvents(std::size_t limit) const;
   std::vector<WANAttackEvent> recentWANAttacks(std::size_t limit) const;
   Summary summary() const;
+  std::size_t eventBufferSize() const;
+  std::size_t wanAttackBufferSize() const;
 
   void cleanup(std::chrono::system_clock::time_point now);
   DeviceStatus statusFor(const DeviceState& device, std::chrono::system_clock::time_point now) const;

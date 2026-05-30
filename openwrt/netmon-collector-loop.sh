@@ -23,7 +23,7 @@ normalize_interval() {
 }
 
 DEVICES_INTERVAL="$(normalize_interval "$DEVICES_INTERVAL" 5)"
-TRAFFIC_INTERVAL="$(normalize_interval "$TRAFFIC_INTERVAL" 5)"
+TRAFFIC_INTERVAL="$(normalize_interval "$TRAFFIC_INTERVAL" 1)"
 IFACE_INTERVAL="$(normalize_interval "$IFACE_INTERVAL" 1)"
 
 logger -t NETMON_COLLECTOR "starting iface_interval=${IFACE_INTERVAL}s devices_interval=${DEVICES_INTERVAL}s traffic_interval=${TRAFFIC_INTERVAL}s"

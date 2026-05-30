@@ -52,6 +52,8 @@ Do not implement these in the first version:
 7. Complex authentication system.
 8. Mobile app.
 
+SQLite retention mode, the Prometheus exporter, and the Grafana dashboard are not part of the first RAM-only MVP, but they are required implementation scope for the extended build after the MVP is stable.
+
 ---
 
 ## 3. Important Constraints
@@ -85,6 +87,7 @@ Target storage usage:
 - Stable over time.
 - Ideally less than 50 MB excluding the compiled binary and frontend static assets.
 - If optional file logging is enabled, it must have rotation and size limits.
+- If SQLite mode is enabled, the database must stay under `storage.sqlite.max_db_mb` through strict retention cleanup and SQLite page-count limits.
 
 ---
 
@@ -102,10 +105,13 @@ LAN Server
   ├─ C++ syslog receiver
   ├─ parser
   ├─ in-memory state store
+  ├─ extended SQLite bounded history store
   ├─ rolling event buffers
   ├─ HTTP API
+  ├─ extended Prometheus /metrics endpoint
   ├─ WebSocket realtime updates
-  └─ web dashboard
+  ├─ web dashboard
+  └─ extended Grafana dashboard artifact for external Grafana
 ```
 
 ---
@@ -121,7 +127,7 @@ Network I/O: Boost.Asio or standalone Asio
 HTTP/WebSocket: Crow, Boost.Beast, or another lightweight C++ web layer
 JSON: nlohmann/json or equivalent
 Config: yaml-cpp, toml++, or a simple custom config parser
-Storage: RAM only
+Storage: RAM by default, SQLite extension mode for bounded history
 Transport from OpenWRT: syslog UDP or TCP
 Dashboard: served by the C++ backend
 Packaging: single binary + config file + systemd service
@@ -353,7 +359,7 @@ openwrt-netmon-lite
 
 ### 8.1 Required features
 
-The C++ server must:
+The C++ server and repository must:
 
 1. Listen for syslog messages on UDP and/or TCP.
 2. Parse messages from OpenWRT.
@@ -374,6 +380,9 @@ The C++ server must:
 10. Avoid unbounded memory growth.
 11. Use RAII and avoid raw owning pointers.
 12. Compile cleanly with warnings enabled.
+13. Implement SQLite storage mode with strict retention for deployments that need bounded history.
+14. Implement a Prometheus exporter endpoint for external scraping when enabled.
+15. Provide a Grafana dashboard JSON that uses the Prometheus metrics as its datasource.
 
 ### 8.2 Configuration
 
@@ -399,6 +408,19 @@ storage:
   enable_debug_file_log: false
   debug_log_path: "./netmon-debug.log"
   debug_log_max_mb: 10
+  sqlite:
+    path: "./openwrt-netmon-lite.db"
+    retention_days: 7
+    max_db_mb: 128
+    max_events: 50000
+    max_traffic_points_per_device: 2016
+    vacuum_on_start: false
+
+metrics:
+  prometheus_enabled: false
+  prometheus_path: "/metrics"
+  include_device_labels: false
+  device_label_mode: "mac_hash"
 
 security:
   bind_lan_only: true
@@ -416,7 +438,13 @@ NETMON_SYSLOG_TCP_ADDR
 NETMON_ENABLE_UDP
 NETMON_ENABLE_TCP
 NETMON_DASHBOARD_TOKEN
+NETMON_STORAGE_MODE
+NETMON_SQLITE_PATH
+NETMON_PROMETHEUS_ENABLED
+NETMON_PROMETHEUS_PATH
 ```
+
+SQLite and Prometheus support are runtime implementation requirements for the extended build, but they must remain disabled by default so the MVP still runs as a RAM-only lightweight service. Grafana support is delivered as a deployment artifact under `deployments/grafana/`.
 
 ---
 
@@ -810,6 +838,27 @@ Events pushed to clients:
 }
 ```
 
+### 13.7 Prometheus metrics
+
+```http
+GET /metrics
+```
+
+This endpoint is disabled by default and is enabled by `metrics.prometheus_enabled: true`.
+
+Example response:
+
+```text
+# HELP openwrt_netmon_up Whether the netmon service is running.
+# TYPE openwrt_netmon_up gauge
+openwrt_netmon_up 1
+# HELP openwrt_netmon_devices Number of devices by status.
+# TYPE openwrt_netmon_devices gauge
+openwrt_netmon_devices{status="online"} 12
+openwrt_netmon_devices{status="idle"} 4
+openwrt_netmon_devices{status="offline"} 3
+```
+
 ---
 
 ## 14. Web Dashboard Requirements
@@ -906,6 +955,125 @@ C++ implementation rules:
    - UndefinedBehaviorSanitizer
    - ThreadSanitizer for concurrency debugging
 
+### 15.1 SQLite storage mode implementation
+
+SQLite mode is a required extended-build feature for deployments that need a small amount of bounded history.
+
+Rules:
+
+1. Keep `storage.mode: "memory"` as the default.
+2. Enable SQLite only when `storage.mode: "sqlite"` is configured.
+3. Run SQLite only on the LAN server, never on the OpenWRT router.
+4. Store only normalized operational telemetry:
+   - devices
+   - traffic samples
+   - recent events
+   - WAN attack events
+5. Do not store packet payloads, DNS query payloads, or unbounded raw log archives.
+6. If SQLite mode is configured and the database cannot be opened or migrated, fail startup clearly instead of silently falling back to memory mode.
+
+Suggested SQLite tables:
+
+```text
+devices(mac primary key, ip, hostname, status, first_seen, last_seen, updated_at)
+traffic_samples(id primary key, mac, ip, ts, rx_bytes, tx_bytes, rx_rate_bps, tx_rate_bps)
+events(id primary key, ts, type, severity, source, message, fields_json)
+wan_attacks(id primary key, ts, in_if, src_ip, dst_ip, src_port, dst_port, proto, length, raw)
+schema_migrations(version primary key, applied_at)
+```
+
+Strict retention requirements:
+
+1. Delete `events` and `wan_attacks` older than `storage.sqlite.retention_days`.
+2. Keep at most `storage.sqlite.max_events` total event rows after cleanup.
+3. Keep at most `storage.sqlite.max_traffic_points_per_device` traffic samples per device.
+4. Enforce `storage.sqlite.max_db_mb` as a hard cap by checking SQLite page size/page count, pruning oldest history rows, and running incremental vacuum when needed.
+5. Run retention cleanup on startup and then at least every 5 minutes.
+6. Use bounded transactions for cleanup so normal ingestion is not blocked for long periods.
+7. Prefer `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=NORMAL`, `PRAGMA auto_vacuum=INCREMENTAL`, and a short busy timeout.
+8. Document how to run `VACUUM` manually, but do not run expensive full vacuum on every cleanup cycle.
+
+Acceptance criteria:
+
+1. With `storage.mode: "sqlite"`, the service restarts and reloads recent device/event state from SQLite.
+2. After sustained mock ingestion, row counts and database size remain within configured limits.
+3. With `storage.mode: "memory"`, no SQLite file is created.
+
+### 15.2 Prometheus exporter endpoint implementation
+
+The Prometheus exporter is a required extended-build feature for deployments that want external monitoring.
+
+Rules:
+
+1. Keep `metrics.prometheus_enabled: false` as the default.
+2. When enabled, expose Prometheus text format at `metrics.prometheus_path`, default `/metrics`.
+3. Serve the endpoint from the same C++ HTTP server and respect the normal LAN-only bind/security settings.
+4. Do not require a local Prometheus server for the C++ service to run.
+5. Do not add high-cardinality labels by default.
+6. Do not expose raw attacker IP labels unless a later config option explicitly enables it.
+7. Per-device labels must be disabled by default; if enabled, prefer MAC hash labels over raw MAC/hostname labels.
+
+Minimum metrics:
+
+```text
+openwrt_netmon_up
+openwrt_netmon_uptime_seconds
+openwrt_netmon_syslog_messages_total{type="..."}
+openwrt_netmon_parse_errors_total
+openwrt_netmon_devices{status="online"}
+openwrt_netmon_devices{status="idle"}
+openwrt_netmon_devices{status="offline"}
+openwrt_netmon_rx_rate_bps
+openwrt_netmon_tx_rate_bps
+openwrt_netmon_wan_attacks_total
+openwrt_netmon_wan_attacks_5m
+openwrt_netmon_event_buffer_size
+```
+
+Acceptance criteria:
+
+1. `GET /metrics` returns `text/plain; version=0.0.4` compatible output when enabled.
+2. `GET /metrics` returns `404` or equivalent disabled response when disabled.
+3. A Prometheus scrape against the LAN server succeeds without changing OpenWRT configuration.
+
+### 15.3 Grafana dashboard implementation
+
+The Grafana dashboard is a required extended-build deployment artifact.
+
+Rules:
+
+1. Do not run Grafana on the OpenWRT router.
+2. Assume Grafana and Prometheus run on the LAN server or another LAN host.
+3. Provide a checked-in dashboard JSON file at:
+
+```text
+deployments/grafana/openwrt-netmon-lite-dashboard.json
+```
+
+4. Use Prometheus as the default datasource.
+5. Include a short provisioning README or example config under `deployments/grafana/`.
+6. The dashboard must still render useful global panels when per-device Prometheus labels are disabled.
+
+Required panels:
+
+1. Service health and uptime.
+2. Device counts by status.
+3. Total download/upload rate.
+4. WAN attacks in the last 5 minutes.
+5. Syslog messages by parsed type.
+6. Parse errors.
+7. Event buffer size.
+8. Optional top-device panels only when per-device metrics are enabled.
+
+Prometheus scrape example:
+
+```yaml
+scrape_configs:
+  - job_name: "openwrt-netmon-lite"
+    static_configs:
+      - targets: ["192.168.10.10:8080"]
+```
+
 ---
 
 ## 16. Suggested Repository Structure
@@ -924,8 +1092,10 @@ openwrt-netmon-lite/
     syslog_server.cpp
     log_parser.cpp
     state_store.cpp
+    sqlite_store.cpp
     traffic.cpp
     web_server.cpp
+    prometheus_exporter.cpp
     ring_buffer.cpp
   include/
     netmon/
@@ -934,8 +1104,10 @@ openwrt-netmon-lite/
       syslog_server.hpp
       log_parser.hpp
       state_store.hpp
+      sqlite_store.hpp
       traffic.hpp
       web_server.hpp
+      prometheus_exporter.hpp
       ring_buffer.hpp
       types.hpp
   web/
@@ -953,9 +1125,14 @@ openwrt-netmon-lite/
     docker/
       Dockerfile
       docker-compose.yml
+    grafana/
+      openwrt-netmon-lite-dashboard.json
+      README.md
   tests/
     parser_tests.cpp
     state_store_tests.cpp
+    sqlite_store_tests.cpp
+    prometheus_exporter_tests.cpp
     ring_buffer_tests.cpp
     traffic_tests.cpp
   testdata/
@@ -974,7 +1151,7 @@ For Ubuntu/Debian development:
 
 ```sh
 sudo apt update
-sudo apt install -y build-essential cmake pkg-config libboost-system-dev libssl-dev
+sudo apt install -y build-essential cmake pkg-config libboost-system-dev libssl-dev libsqlite3-dev
 ```
 
 If using Crow from the system package repository or vendored source, document the selected installation method clearly.
@@ -985,6 +1162,7 @@ If using additional libraries, document them clearly:
 nlohmann/json
 yaml-cpp or toml++
 Crow or Boost.Beast
+SQLite3 for extended SQLite storage mode
 GoogleTest or Catch2 for tests
 ```
 
@@ -1210,8 +1388,8 @@ Follow these rules:
 1. Implement the MVP in small commits or small steps.
 2. Prefer simple C++ code over complex abstractions.
 3. Keep dependencies minimal.
-4. Do not introduce persistent databases unless explicitly requested.
-5. Do not add Prometheus/Loki/ELK in the MVP.
+4. Do not introduce persistent databases in the MVP path; implement SQLite only through the configured extended storage mode.
+5. Do not add Prometheus/Loki/ELK in the MVP path; implement the Prometheus exporter and Grafana dashboard as disabled-by-default extended features.
 6. Do not require root for the server by default.
 7. Use port `1514` for syslog by default.
 8. Use port `8080` for the dashboard by default.
@@ -1232,21 +1410,18 @@ Follow these rules:
 
 Possible later additions:
 
-1. Optional SQLite mode with strict retention.
-2. Optional Prometheus exporter endpoint.
-3. Optional Grafana dashboard.
-4. Optional Telegram alerts.
-5. Optional nftables auto-block integration.
-6. OUI vendor lookup from local database.
-7. Device alias mapping.
-8. Import/export known devices.
-9. Multi-router support.
-10. WiFi signal strength if OpenWRT is AP.
-11. Flow export support using softflowd.
-12. Anomaly detection based on rolling baseline.
-13. Linux netlink integration.
-14. nftables counter reader.
-15. eBPF-based local sensor for non-OpenWRT Linux gateways.
+1. Optional Telegram alerts.
+2. Optional nftables auto-block integration.
+3. OUI vendor lookup from local database.
+4. Device alias mapping.
+5. Import/export known devices.
+6. Multi-router support.
+7. WiFi signal strength if OpenWRT is AP.
+8. Flow export support using softflowd.
+9. Anomaly detection based on rolling baseline.
+10. Linux netlink integration.
+11. nftables counter reader.
+12. eBPF-based local sensor for non-OpenWRT Linux gateways.
 
 ---
 
@@ -1281,8 +1456,17 @@ These references are included for the coding agent to verify assumptions and imp
 9. Crow C++ web framework:  
    https://crowcpp.org/master/
 
-10. Prometheus storage retention reference, useful only if optional Prometheus mode is added later:  
+10. Prometheus storage retention reference, useful for external Prometheus deployments:
    https://prometheus.io/docs/prometheus/latest/storage/
+
+11. Prometheus exposition format reference for `/metrics`:
+   https://prometheus.io/docs/instrumenting/exposition_formats/
+
+12. SQLite documentation:
+   https://www.sqlite.org/docs.html
+
+13. Grafana dashboard provisioning reference:
+   https://grafana.com/docs/grafana/latest/administration/provisioning/
 
 ---
 

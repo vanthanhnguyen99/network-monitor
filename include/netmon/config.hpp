@@ -25,6 +25,17 @@ struct Config {
   bool enable_debug_file_log = false;
   std::string debug_log_path = "./netmon-debug.log";
   int debug_log_max_mb = 10;
+  std::string sqlite_path = "./openwrt-netmon-lite.db";
+  int sqlite_retention_days = 7;
+  int sqlite_max_db_mb = 128;
+  std::size_t sqlite_max_events = 50000;
+  std::size_t sqlite_max_traffic_points_per_device = 2016;
+  bool sqlite_vacuum_on_start = false;
+
+  bool prometheus_enabled = false;
+  std::string prometheus_path = "/metrics";
+  bool prometheus_include_device_labels = false;
+  std::string prometheus_device_label_mode = "mac_hash";
 
   bool bind_lan_only = true;
   std::string dashboard_token;

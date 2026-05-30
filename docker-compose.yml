@@ -12,12 +12,16 @@ services:
       - "1514:1514/tcp"
     volumes:
       - ./config.example.yaml:/app/config.yaml:ro
+      - netmon-sqlite-data:/data
     environment:
       NETMON_HTTP_ADDR: "0.0.0.0:8080"
       NETMON_SYSLOG_UDP_ADDR: "0.0.0.0:1514"
       NETMON_SYSLOG_TCP_ADDR: "0.0.0.0:1514"
       NETMON_ENABLE_UDP: "true"
       NETMON_ENABLE_TCP: "false"
+      NETMON_STORAGE_MODE: "sqlite"
+      NETMON_SQLITE_PATH: "/data/openwrt-netmon-lite.db"
+      NETMON_PROMETHEUS_ENABLED: "true"
     read_only: true
     tmpfs:
       - /tmp:size=16m,noexec,nosuid,nodev
@@ -25,3 +29,6 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+volumes:
+  netmon-sqlite-data:

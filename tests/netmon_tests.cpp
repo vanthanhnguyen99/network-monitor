@@ -1,12 +1,19 @@
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <unistd.h>
 
 #include "netmon/config.hpp"
 #include "netmon/log_parser.hpp"
 #include "netmon/net_utils.hpp"
+#include "netmon/prometheus_exporter.hpp"
 #include "netmon/ring_buffer.hpp"
+#include "netmon/runtime_stats.hpp"
+#include "netmon/sqlite_store.hpp"
 #include "netmon/state_store.hpp"
 #include "netmon/utils.hpp"
 #include "netmon/web_server.hpp"
@@ -253,6 +260,175 @@ void testWebSocketAccept() {
   CHECK(netmon::websocketAcceptKey("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 }
 
+void testNestedConfigOptions() {
+  const std::string path = "/tmp/openwrt-netmon-lite-config-test-" + std::to_string(getpid()) + ".yaml";
+  {
+    std::ofstream out(path);
+    out << "storage:\n"
+        << "  mode: \"sqlite\"\n"
+        << "  sqlite:\n"
+        << "    path: \"/tmp/netmon.db\"\n"
+        << "    retention_days: 3\n"
+        << "    max_db_mb: 9\n"
+        << "    max_events: 12\n"
+        << "    max_traffic_points_per_device: 13\n"
+        << "    vacuum_on_start: true\n"
+        << "metrics:\n"
+        << "  prometheus_enabled: true\n"
+        << "  prometheus_path: \"metrics\"\n"
+        << "  include_device_labels: true\n"
+        << "  device_label_mode: \"raw_mac\"\n";
+  }
+
+  const netmon::Config config = netmon::loadConfig(path);
+  CHECK(config.storage_mode == "sqlite");
+  CHECK(config.sqlite_path == "/tmp/netmon.db");
+  CHECK(config.sqlite_retention_days == 3);
+  CHECK(config.sqlite_max_db_mb == 9);
+  CHECK(config.sqlite_max_events == 12);
+  CHECK(config.sqlite_max_traffic_points_per_device == 13);
+  CHECK(config.sqlite_vacuum_on_start);
+  CHECK(config.prometheus_enabled);
+  CHECK(config.prometheus_path == "/metrics");
+  CHECK(config.prometheus_include_device_labels);
+  CHECK(config.prometheus_device_label_mode == "raw_mac");
+  std::remove(path.c_str());
+}
+
+void testPrometheusExporter() {
+  netmon::Config config = testConfig();
+  netmon::StateStore store(config);
+  netmon::RuntimeStats stats;
+
+  netmon::DeviceState device;
+  device.mac = "00:e0:4c:68:02:89";
+  device.ip = "192.168.10.157";
+  device.last_seen = netmon::nowSystem();
+  device.source = "netdev";
+  store.updateDevice(device);
+
+  stats.recordSyslogMessage("dhcp");
+  stats.recordParseError();
+  stats.recordWANAttack();
+
+  const std::string body = netmon::renderPrometheusMetrics(config, store, stats, std::chrono::steady_clock::now() - std::chrono::seconds(10));
+  CHECK(body.find("openwrt_netmon_up 1") != std::string::npos);
+  CHECK(body.find("openwrt_netmon_syslog_messages_total{type=\"dhcp\"} 1") != std::string::npos);
+  CHECK(body.find("openwrt_netmon_parse_errors_total 1") != std::string::npos);
+  CHECK(body.find("openwrt_netmon_devices{status=\"online\"} 1") != std::string::npos);
+  CHECK(body.find("openwrt_netmon_wan_attacks_total 1") != std::string::npos);
+}
+
+void testSqliteStorePersistenceAndRetention() {
+  const std::string base = "/tmp/openwrt-netmon-lite-sqlite-test-" + std::to_string(getpid()) + ".db";
+  std::remove(base.c_str());
+  std::remove((base + "-wal").c_str());
+  std::remove((base + "-shm").c_str());
+
+  netmon::Config config = testConfig();
+  config.storage_mode = "sqlite";
+  config.sqlite_path = base;
+  config.sqlite_retention_days = 1;
+  config.sqlite_max_db_mb = 16;
+  config.sqlite_max_events = 1;
+  config.sqlite_max_traffic_points_per_device = 8;
+
+  try {
+    netmon::SqliteStore sqlite(config);
+    netmon::StateStore state(config);
+
+    netmon::DeviceState device;
+    device.mac = "00:e0:4c:68:02:89";
+    device.ip = "192.168.10.157";
+    device.hostname = "test-device";
+    device.last_seen = netmon::nowSystem();
+    device.last_traffic = device.last_seen;
+    device.last_rate = device.last_seen;
+    device.source = "netdev";
+    device.rx_bytes_total = 1200;
+    device.tx_bytes_total = 800;
+    device.rx_rate_bps = 320.0;
+    device.tx_rate_bps = 160.0;
+    state.updateDevice(device);
+    sqlite.upsertDevices(state.devices());
+
+    netmon::TrafficSnapshot old_traffic;
+    old_traffic.mac = device.mac;
+    old_traffic.ip = device.ip;
+    old_traffic.ts = netmon::nowSystem() - std::chrono::hours(30);
+    old_traffic.rx_bytes = 9000;
+    old_traffic.tx_bytes = 9000;
+    sqlite.insertTraffic(old_traffic);
+
+    netmon::TrafficSnapshot first_traffic = old_traffic;
+    first_traffic.ts = netmon::nowSystem() - std::chrono::hours(3);
+    first_traffic.rx_bytes = 100;
+    first_traffic.tx_bytes = 50;
+    sqlite.insertTraffic(first_traffic);
+
+    netmon::TrafficSnapshot second_traffic = first_traffic;
+    second_traffic.ts = netmon::nowSystem() - std::chrono::hours(2);
+    second_traffic.rx_bytes = 500;
+    second_traffic.tx_bytes = 150;
+    sqlite.insertTraffic(second_traffic);
+
+    netmon::TrafficSnapshot reset_traffic = second_traffic;
+    reset_traffic.ts = netmon::nowSystem() - std::chrono::hours(1);
+    reset_traffic.rx_bytes = 50;
+    reset_traffic.tx_bytes = 20;
+    sqlite.insertTraffic(reset_traffic);
+
+    netmon::TrafficSnapshot latest_traffic = reset_traffic;
+    latest_traffic.ts = netmon::nowSystem();
+    latest_traffic.rx_bytes = 90;
+    latest_traffic.tx_bytes = 30;
+    sqlite.insertTraffic(latest_traffic);
+
+    netmon::Event old_event;
+    old_event.id = "old";
+    old_event.ts = netmon::nowSystem() - std::chrono::hours(48);
+    old_event.type = "device";
+    old_event.message = "old";
+    sqlite.insertEvent(old_event);
+
+    netmon::Event new_event;
+    new_event.id = "new";
+    new_event.ts = netmon::nowSystem();
+    new_event.type = "device";
+    new_event.message = "new";
+    sqlite.insertEvent(new_event);
+    sqlite.applyRetention();
+
+    netmon::StateStore restored(config);
+    sqlite.loadInto(restored);
+    CHECK(restored.devices().size() == 1);
+    CHECK(restored.devices()[0].hostname == "test-device");
+    CHECK(restored.devices()[0].last_traffic.time_since_epoch().count() != 0);
+    CHECK(restored.devices()[0].last_rate.time_since_epoch().count() != 0);
+    CHECK(std::fabs(restored.devices()[0].rx_rate_bps - 320.0) < 0.001);
+    const auto events = restored.recentEvents(10);
+    CHECK(events.size() == 1);
+    CHECK(events[0].id == "new");
+    const auto totals = sqlite.deviceTrafficTotals(std::chrono::hours(24), 10);
+    CHECK(totals.size() == 1);
+    CHECK(totals[0].rx_bytes == 490);
+    CHECK(totals[0].tx_bytes == 130);
+    CHECK(totals[0].samples == 4);
+  } catch (const std::runtime_error& ex) {
+    const std::string message = ex.what();
+    if (message.find("requires libsqlite3") == std::string::npos) {
+      std::cerr << "unexpected sqlite error: " << message << '\n';
+      ++failures;
+    } else {
+      std::cerr << "sqlite test skipped: " << message << '\n';
+    }
+  }
+
+  std::remove(base.c_str());
+  std::remove((base + "-wal").c_str());
+  std::remove((base + "-shm").c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -271,6 +447,9 @@ int main() {
   testMaxLineLength();
   testUnknownLog();
   testWebSocketAccept();
+  testNestedConfigOptions();
+  testPrometheusExporter();
+  testSqliteStorePersistenceAndRetention();
 
   if (failures != 0) {
     std::cerr << failures << " test failure(s)\n";

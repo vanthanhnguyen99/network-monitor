@@ -19,6 +19,19 @@ storage:
   enable_debug_file_log: false
   debug_log_path: "./netmon-debug.log"
   debug_log_max_mb: 10
+  sqlite:
+    path: "./openwrt-netmon-lite.db"
+    retention_days: 7
+    max_db_mb: 128
+    max_events: 50000
+    max_traffic_points_per_device: 2016
+    vacuum_on_start: false
+
+metrics:
+  prometheus_enabled: false
+  prometheus_path: "/metrics"
+  include_device_labels: false
+  device_label_mode: "mac_hash"
 
 security:
   bind_lan_only: true

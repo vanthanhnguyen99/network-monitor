@@ -9,6 +9,7 @@
 #include <map>
 #include <netinet/in.h>
 #include <sstream>
+#include <filesystem>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "netmon/net_utils.hpp"
+#include "netmon/prometheus_exporter.hpp"
 #include "netmon/utils.hpp"
 
 #ifndef NETMON_VERSION
@@ -120,6 +122,21 @@ std::string tagsJson(const std::vector<std::string>& tags) {
   return out.str();
 }
 
+std::string statsByTypeJson(const std::map<std::string, std::uint64_t>& values) {
+  std::ostringstream out;
+  out << '{';
+  bool first = true;
+  for (const auto& [key, value] : values) {
+    if (!first) {
+      out << ',';
+    }
+    first = false;
+    out << jsonQuote(key) << ':' << value;
+  }
+  out << '}';
+  return out.str();
+}
+
 std::string deviceJson(const DeviceState& device) {
   std::ostringstream out;
   out << '{'
@@ -170,6 +187,33 @@ std::string wanAttackJson(const WANAttackEvent& event) {
       << "\"proto\":" << jsonQuote(event.proto) << ','
       << "\"length\":" << jsonQuote(event.length) << ','
       << "\"raw\":" << jsonQuote(event.raw)
+      << '}';
+  return out.str();
+}
+
+std::string trafficPointJson(const TrafficHistoryPoint& point) {
+  std::ostringstream out;
+  out << '{'
+      << "\"ts\":" << jsonQuote(formatIso8601(point.ts)) << ','
+      << "\"rx_rate_bps\":" << point.rx_rate_bps << ','
+      << "\"tx_rate_bps\":" << point.tx_rate_bps << ','
+      << "\"samples\":" << point.samples
+      << '}';
+  return out.str();
+}
+
+std::string deviceTrafficTotalJson(const DeviceTrafficTotal& total) {
+  std::ostringstream out;
+  out << '{'
+      << "\"mac\":" << jsonQuote(total.mac) << ','
+      << "\"ip\":" << jsonQuote(total.ip) << ','
+      << "\"hostname\":" << jsonQuote(total.hostname) << ','
+      << "\"first_ts\":" << jsonQuote(formatIso8601(total.first_ts)) << ','
+      << "\"last_ts\":" << jsonQuote(formatIso8601(total.last_ts)) << ','
+      << "\"rx_bytes\":" << total.rx_bytes << ','
+      << "\"tx_bytes\":" << total.tx_bytes << ','
+      << "\"total_bytes\":" << (total.rx_bytes + total.tx_bytes) << ','
+      << "\"samples\":" << total.samples
       << '}';
   return out.str();
 }
@@ -275,8 +319,8 @@ std::string base64Encode(const std::uint8_t* data, std::size_t size) {
 
 }  // namespace
 
-WebServer::WebServer(Config config, StateStore& state, std::chrono::steady_clock::time_point started_at)
-    : config_(std::move(config)), state_(state), started_at_(started_at) {}
+WebServer::WebServer(Config config, StateStore& state, RuntimeStats& stats, SqliteStore* sqlite_store, std::chrono::steady_clock::time_point started_at)
+    : config_(std::move(config)), state_(state), stats_(stats), sqlite_store_(sqlite_store), started_at_(started_at) {}
 
 WebServer::~WebServer() {
   stop();
@@ -443,14 +487,38 @@ void WebServer::routeHttp(int client_fd, const Request& request) {
     sendJson(client_fd, healthJson());
   } else if (request.path == "/api/summary") {
     sendJson(client_fd, summaryJson());
+  } else if (request.path == "/api/integrations") {
+    sendJson(client_fd, integrationsJson());
   } else if (request.path == "/api/devices") {
-    sendJson(client_fd, devicesJson());
+    const std::size_t limit = static_cast<std::size_t>(parseUint64(queryParam(request, "limit"), 1000));
+    sendJson(client_fd, devicesJson(request, std::min<std::size_t>(limit, 5000)));
   } else if (request.path == "/api/events") {
     const std::size_t limit = static_cast<std::size_t>(parseUint64(queryParam(request, "limit"), 100));
-    sendJson(client_fd, eventsJson(std::min<std::size_t>(limit, 1000)));
+    sendJson(client_fd, eventsJson(request, std::min<std::size_t>(limit, 1000)));
   } else if (request.path == "/api/wan-attacks") {
     const std::size_t limit = static_cast<std::size_t>(parseUint64(queryParam(request, "limit"), 100));
-    sendJson(client_fd, wanAttacksJson(std::min<std::size_t>(limit, 1000)));
+    sendJson(client_fd, wanAttacksJson(request, std::min<std::size_t>(limit, 1000)));
+  } else if (request.path == "/api/traffic-history") {
+    const std::size_t limit = static_cast<std::size_t>(parseUint64(queryParam(request, "limit"), 180));
+    sendJson(client_fd, trafficHistoryJson(request, std::min<std::size_t>(limit, 720)));
+  } else if (request.path == "/api/device-traffic-24h") {
+    const std::size_t limit = static_cast<std::size_t>(parseUint64(queryParam(request, "limit"), 50));
+    sendJson(client_fd, deviceTraffic24hJson(std::min<std::size_t>(limit, 500)));
+  } else if (request.path == config_.prometheus_path) {
+    if (!config_.prometheus_enabled) {
+      sendNotFound(client_fd);
+    } else if (!authorized(request)) {
+      sendUnauthorized(client_fd);
+    } else {
+      sendPrometheus(client_fd, renderPrometheusMetrics(config_, state_, stats_, started_at_));
+    }
+  } else if (request.path == "/grafana/dashboard.json" || request.path == "/grafana/openwrt-netmon-lite-dashboard.json") {
+    const std::string body = grafanaDashboardJson();
+    if (body.empty()) {
+      sendNotFound(client_fd);
+    } else {
+      sendResponse(client_fd, 200, "OK", "application/json; charset=utf-8", body);
+    }
   } else if (request.path == "/" || request.path == "/index.html" || request.path == "/app.js" || request.path == "/style.css") {
     std::string content_type;
     const std::string path = request.path == "/" ? "/index.html" : request.path;
@@ -554,6 +622,10 @@ void WebServer::sendJson(int client_fd, const std::string& body) const {
   sendResponse(client_fd, 200, "OK", "application/json; charset=utf-8", body);
 }
 
+void WebServer::sendPrometheus(int client_fd, const std::string& body) const {
+  sendResponse(client_fd, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body);
+}
+
 void WebServer::sendNotFound(int client_fd) const {
   sendResponse(client_fd, 404, "Not Found", "application/json; charset=utf-8", "{\"error\":\"not_found\"}");
 }
@@ -604,50 +676,191 @@ std::string WebServer::summaryJson() const {
   return out.str();
 }
 
-std::string WebServer::devicesJson() const {
-  const std::vector<DeviceState> devices = state_.devices();
+std::string WebServer::integrationsJson() const {
+  const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at_).count();
+  const Summary summary = state_.summary();
+  const RuntimeStatsSnapshot runtime = stats_.snapshot();
+  const std::string storage_mode = lower(config_.storage_mode);
+  const bool sqlite_enabled = storage_mode == "sqlite";
+
   std::ostringstream out;
-  out << '[';
+  out << '{'
+      << "\"version\":" << jsonQuote(NETMON_VERSION) << ','
+      << "\"uptime_seconds\":" << uptime << ','
+      << "\"storage\":{"
+      << "\"mode\":" << jsonQuote(config_.storage_mode) << ','
+      << "\"sqlite_enabled\":" << (sqlite_enabled ? "true" : "false") << ','
+      << "\"sqlite_available\":" << (sqlite_store_ != nullptr && sqlite_store_->enabled() ? "true" : "false") << ','
+      << "\"sqlite_path\":" << jsonQuote(config_.sqlite_path) << ','
+      << "\"retention_days\":" << config_.sqlite_retention_days << ','
+      << "\"max_db_mb\":" << config_.sqlite_max_db_mb << ','
+      << "\"max_events\":" << config_.sqlite_max_events << ','
+      << "\"max_traffic_points_per_device\":" << config_.sqlite_max_traffic_points_per_device << ','
+      << "\"vacuum_on_start\":" << (config_.sqlite_vacuum_on_start ? "true" : "false")
+      << "},"
+      << "\"prometheus\":{"
+      << "\"enabled\":" << (config_.prometheus_enabled ? "true" : "false") << ','
+      << "\"path\":" << jsonQuote(config_.prometheus_path) << ','
+      << "\"include_device_labels\":" << (config_.prometheus_include_device_labels ? "true" : "false") << ','
+      << "\"device_label_mode\":" << jsonQuote(config_.prometheus_device_label_mode)
+      << "},"
+      << "\"grafana\":{"
+      << "\"dashboard_url\":\"/grafana/dashboard.json\","
+      << "\"dashboard_file\":\"deployments/grafana/openwrt-netmon-lite-dashboard.json\","
+      << "\"datasource\":\"Prometheus\""
+      << "},"
+      << "\"data_sources\":{"
+      << "\"default\":\"live\","
+      << "\"sqlite_query_enabled\":" << (sqlite_store_ != nullptr && sqlite_store_->enabled() ? "true" : "false") << ','
+      << "\"realtime_source\":\"memory\""
+      << "},"
+      << "\"runtime\":{"
+      << "\"syslog_messages_total\":" << runtime.syslog_messages_total << ','
+      << "\"parse_errors_total\":" << runtime.parse_errors_total << ','
+      << "\"wan_attacks_total\":" << runtime.wan_attacks_total << ','
+      << "\"syslog_messages_by_type\":" << statsByTypeJson(runtime.syslog_messages_by_type) << ','
+      << "\"event_buffer_size\":" << state_.eventBufferSize() << ','
+      << "\"wan_attack_buffer_size\":" << state_.wanAttackBufferSize() << ','
+      << "\"active_devices\":" << summary.active_devices << ','
+      << "\"idle_devices\":" << summary.idle_devices << ','
+      << "\"offline_devices\":" << summary.offline_devices << ','
+      << "\"unknown_devices\":" << summary.unknown_devices
+      << "}"
+      << '}';
+  return out.str();
+}
+
+bool WebServer::useSqliteSource(const Request& request) const {
+  return lower(queryParam(request, "source")) == "sqlite" && sqlite_store_ != nullptr && sqlite_store_->enabled();
+}
+
+std::string WebServer::sourceName(const Request& request) const {
+  return useSqliteSource(request) ? "sqlite" : "live";
+}
+
+std::string WebServer::devicesJson(const Request& request, std::size_t limit) const {
+  std::vector<DeviceState> devices = useSqliteSource(request) ? sqlite_store_->devices(limit) : state_.devices();
+  if (!useSqliteSource(request) && limit > 0 && devices.size() > limit) {
+    devices.resize(limit);
+  }
+  std::ostringstream out;
+  out << "{\"source\":" << jsonQuote(sourceName(request)) << ",\"items\":[";
   for (std::size_t i = 0; i < devices.size(); ++i) {
     if (i != 0) {
       out << ',';
     }
     out << deviceJson(devices[i]);
   }
-  out << ']';
+  out << "]}";
   return out.str();
 }
 
-std::string WebServer::eventsJson(std::size_t limit) const {
-  const std::vector<Event> events = state_.recentEvents(limit);
+std::string WebServer::eventsJson(const Request& request, std::size_t limit) const {
+  const std::vector<Event> events = useSqliteSource(request) ? sqlite_store_->recentEvents(limit) : state_.recentEvents(limit);
   std::ostringstream out;
-  out << '[';
+  out << "{\"source\":" << jsonQuote(sourceName(request)) << ",\"items\":[";
   bool first = true;
-  for (auto it = events.rbegin(); it != events.rend(); ++it) {
-    if (!first) {
-      out << ',';
+  if (useSqliteSource(request)) {
+    for (const Event& event : events) {
+      if (!first) {
+        out << ',';
+      }
+      first = false;
+      out << eventJson(event);
     }
-    first = false;
-    out << eventJson(*it);
+  } else {
+    for (auto it = events.rbegin(); it != events.rend(); ++it) {
+      if (!first) {
+        out << ',';
+      }
+      first = false;
+      out << eventJson(*it);
+    }
   }
-  out << ']';
+  out << "]}";
   return out.str();
 }
 
-std::string WebServer::wanAttacksJson(std::size_t limit) const {
-  const std::vector<WANAttackEvent> attacks = state_.recentWANAttacks(limit);
+std::string WebServer::wanAttacksJson(const Request& request, std::size_t limit) const {
+  const std::vector<WANAttackEvent> attacks = useSqliteSource(request) ? sqlite_store_->recentWANAttacks(limit) : state_.recentWANAttacks(limit);
   std::ostringstream out;
-  out << '[';
+  out << "{\"source\":" << jsonQuote(sourceName(request)) << ",\"items\":[";
   bool first = true;
-  for (auto it = attacks.rbegin(); it != attacks.rend(); ++it) {
-    if (!first) {
-      out << ',';
+  if (useSqliteSource(request)) {
+    for (const WANAttackEvent& attack : attacks) {
+      if (!first) {
+        out << ',';
+      }
+      first = false;
+      out << wanAttackJson(attack);
     }
-    first = false;
-    out << wanAttackJson(*it);
+  } else {
+    for (auto it = attacks.rbegin(); it != attacks.rend(); ++it) {
+      if (!first) {
+        out << ',';
+      }
+      first = false;
+      out << wanAttackJson(*it);
+    }
   }
-  out << ']';
+  out << "]}";
   return out.str();
+}
+
+std::string WebServer::trafficHistoryJson(const Request& request, std::size_t limit) const {
+  std::ostringstream out;
+  out << "{\"source\":" << jsonQuote(sourceName(request)) << ",\"items\":[";
+  bool first = true;
+  if (useSqliteSource(request)) {
+    const std::vector<TrafficHistoryPoint> points = sqlite_store_->trafficHistory(limit);
+    for (const TrafficHistoryPoint& point : points) {
+      if (!first) {
+        out << ',';
+      }
+      first = false;
+      out << trafficPointJson(point);
+    }
+  }
+  out << "]}";
+  return out.str();
+}
+
+std::string WebServer::deviceTraffic24hJson(std::size_t limit) const {
+  const bool available = sqlite_store_ != nullptr && sqlite_store_->enabled();
+  std::ostringstream out;
+  out << "{\"source\":" << jsonQuote(available ? "sqlite" : "unavailable") << ",\"window_hours\":24,\"items\":[";
+  bool first = true;
+  if (available) {
+    const std::vector<DeviceTrafficTotal> totals = sqlite_store_->deviceTrafficTotals(std::chrono::hours(24), limit);
+    for (const DeviceTrafficTotal& total : totals) {
+      if (!first) {
+        out << ',';
+      }
+      first = false;
+      out << deviceTrafficTotalJson(total);
+    }
+  }
+  out << "]}";
+  return out.str();
+}
+
+std::string WebServer::grafanaDashboardJson() const {
+  const std::vector<std::string> candidates = {
+      "./deployments/grafana/openwrt-netmon-lite-dashboard.json",
+      "/app/deployments/grafana/openwrt-netmon-lite-dashboard.json",
+      "../deployments/grafana/openwrt-netmon-lite-dashboard.json",
+  };
+
+  for (const std::string& path : candidates) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      continue;
+    }
+    std::ostringstream out;
+    out << input.rdbuf();
+    return out.str();
+  }
+  return {};
 }
 
 void WebServer::addWebSocketClient(int fd) {

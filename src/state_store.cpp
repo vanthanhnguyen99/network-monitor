@@ -4,6 +4,7 @@
 #include <cmath>
 #include <mutex>
 #include <sstream>
+#include <utility>
 
 #include "netmon/utils.hpp"
 
@@ -214,11 +215,14 @@ void StateStore::addWANAttack(const WANAttackEvent& event) {
 }
 
 std::vector<DeviceState> StateStore::devices() const {
+  const auto now = nowSystem();
   std::shared_lock lock(mutex_);
   std::vector<DeviceState> out;
   out.reserve(devices_by_key_.size());
   for (const auto& [_, device] : devices_by_key_) {
-    out.push_back(device);
+    DeviceState current = device;
+    current.status = statusFor(current, now);
+    out.push_back(std::move(current));
   }
   std::sort(out.begin(), out.end(), [](const DeviceState& lhs, const DeviceState& rhs) {
     if (lhs.status != rhs.status) {
@@ -294,6 +298,16 @@ Summary StateStore::summary() const {
     }
   }
   return out;
+}
+
+std::size_t StateStore::eventBufferSize() const {
+  std::shared_lock lock(mutex_);
+  return events_.size();
+}
+
+std::size_t StateStore::wanAttackBufferSize() const {
+  std::shared_lock lock(mutex_);
+  return wan_attacks_.size();
 }
 
 void StateStore::cleanup(std::chrono::system_clock::time_point now) {
@@ -423,6 +437,12 @@ void StateStore::mergeDeviceLocked(DeviceState& current, const DeviceState& inco
 
   if (normalized.last_dhcp.time_since_epoch().count() != 0) {
     current.last_dhcp = normalized.last_dhcp;
+  }
+  if (normalized.last_traffic.time_since_epoch().count() != 0) {
+    current.last_traffic = normalized.last_traffic;
+  }
+  if (normalized.last_rate.time_since_epoch().count() != 0) {
+    current.last_rate = normalized.last_rate;
   }
   if (normalized.rx_bytes_total > 0) {
     current.rx_bytes_total = normalized.rx_bytes_total;
